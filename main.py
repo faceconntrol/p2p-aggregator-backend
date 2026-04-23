@@ -145,7 +145,7 @@ async def fetch_bybit_merchants(
         "tokenId": crypto,
         "currencyId": fiat,
         "side": "1",
-        "size": "20",
+        "size": "30",
         "page": "1",
         "amount": str(int(amount))
     }
@@ -167,7 +167,6 @@ async def fetch_bybit_merchants(
             print(f"📡 Bybit status: {response.status_code}")
 
             if response.status_code != 200:
-                print(f"❌ Bybit response: {response.text[:500]}")
                 return []
 
             data = response.json()
@@ -199,12 +198,13 @@ async def fetch_bybit_merchants(
 
                     payments = item.get("paymentIds", item.get("payments", []))
 
-                    # Фильтр по сумме
-                    if not (min_amount <= amount <= max_amount):
+                    # МЯГКИЕ ФИЛЬТРЫ
+                    # Проверяем что сумма входит в лимиты
+                    if amount < min_amount or amount > max_amount:
                         continue
 
-                    # Фильтр по надёжности
-                    if completed_rate < 0.80:
+                    # Отсекаем только явно подозрительных (rate < 50%)
+                    if completed_rate < 0.50:
                         continue
 
                     merchants.append({
@@ -218,18 +218,24 @@ async def fetch_bybit_merchants(
                         "success_rate": round(completed_rate * 100, 1),
                         "completed_trades": completed_count,
                         "payment_methods": payments if isinstance(payments, list) else [str(payments)],
-                        "is_verified": completed_rate >= 0.85,
+                        "is_verified": completed_rate >= 0.85 and completed_count >= 10,
                         "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}" if adv_no else "bybit://",
-                        "web_link": f"https://www.bybit.com/fiat/trade/otc"
+                        "web_link": "https://www.bybit.com/fiat/trade/otc"
                     })
 
                 except Exception as e:
-                    print(f"⚠️ parse error for {item.get('nickname', '?')}: {e}")
+                    print(f"⚠️ parse error: {e}")
                     continue
 
+            # Сортировка по цене (дешёвые сверху)
             merchants.sort(key=lambda x: x["price"])
             print(f"✅ Bybit filtered: {len(merchants)} merchants")
-            return merchants[:20]
+            
+            # Логируем топ-3 для проверки
+            for m in merchants[:3]:
+                print(f"  {m['merchant_name']}: {m['price']} RUB, rate: {m['success_rate']}%")
+            
+            return merchants[:30]
 
         except Exception as e:
             print(f"❌ Bybit exception: {e}")
@@ -282,7 +288,8 @@ async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_met
                     finish_rate = item.get("monthFinishRate", 0.95)
                     order_count = item.get("monthOrderCount", 0)
                     
-                    if finish_rate < 0.80 or max_amount < amount:
+                    # Мягкие фильтры
+                    if finish_rate < 0.50 or max_amount < amount:
                         continue
                     
                     ad_id = item.get("adId", "")
@@ -344,7 +351,8 @@ async def get_p2p_merchants(
         print("⚠️ No data from exchanges, using mock")
         all_merchants = await get_mock_merchants(amount)
     
-    filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
+    # Фильтруем: сумма входит в лимиты
+    filtered = [m for m in all_merchants if amount >= m["min_amount"]][:30]
     
     best_rate = filtered[0]["price"] if filtered else 0
     best_exchange = filtered[0]["exchange"] if filtered else "bybit"
