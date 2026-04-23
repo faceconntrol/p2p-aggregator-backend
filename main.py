@@ -2,12 +2,12 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from typing import List, Dict, Any
+from datetime import datetime, timezone
+import json
 
 app = FastAPI(title="P2P Aggregator API", version="1.0.0")
 
-# CORS для мобильного приложения
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,19 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTTP клиент
-async def get_http_client():
-    return httpx.AsyncClient(
-        timeout=15.0,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Origin": "https://www.bybit.com",
-            "Referer": "https://www.bybit.com/"
-        }
-    )
-
-# Маппинг способов оплаты для Bybit
 PAYMENT_MAPPING = {
     "Sberbank": "Sberbank",
     "Tinkoff": "TinkoffNew",
@@ -36,19 +23,10 @@ PAYMENT_MAPPING = {
     "AlfaBank": "AlfaBank",
     "Raiffeisen": "RaiffeisenBank",
     "SBP": "SBP",
-    "QIWI": "QIWI",
-    "YooMoney": "YooMoney"
 }
 
-async def fetch_bybit_merchants(
-    crypto: str = "USDT",
-    fiat: str = "RUB",
-    amount: float = 10000,
-    payment_methods: List[str] = ["Tinkoff"]
-) -> List[Dict[str, Any]]:
-    """Запрос к Bybit P2P API"""
+async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict]:
     url = "https://api2.bybit.com/fiat/otc/item/online"
-    
     bybit_payments = [PAYMENT_MAPPING.get(m, m) for m in payment_methods]
     
     payload = {
@@ -63,23 +41,36 @@ async def fetch_bybit_merchants(
         "canTrade": True
     }
     
-    async with await get_http_client() as client:
+    print(f"🔍 Bybit request payload: {json.dumps(payload)}")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Origin": "https://www.bybit.com",
+        "Referer": "https://www.bybit.com/fiat/trade/otc",
+        "Content-Type": "application/json"
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
         try:
             response = await client.post(url, json=payload)
+            print(f"📡 Bybit status: {response.status_code}")
             
             if response.status_code != 200:
-                print(f"Bybit error: {response.status_code}")
+                print(f"❌ Bybit error response: {response.text[:500]}")
                 return []
             
             data = response.json()
+            print(f"📦 Bybit retCode: {data.get('retCode')}, retMsg: {data.get('retMsg')}")
             
             if data.get("retCode") != 0:
-                print(f"Bybit API error: {data.get('retMsg')}")
                 return []
             
             items = data.get("result", {}).get("items", [])
-            merchants = []
+            print(f"✅ Bybit found {len(items)} items")
             
+            merchants = []
             for item in items:
                 try:
                     price = float(item.get("price", 0))
@@ -92,13 +83,12 @@ async def fetch_bybit_merchants(
                     if completed_rate < 0.90 or quantity < amount:
                         continue
                     
-                    adv_no = item.get("advNo") or item.get("id", "")
+                    adv_no = item.get("advNo", "")
                     
                     merchants.append({
                         "id": adv_no,
                         "exchange": "bybit",
                         "merchant_name": item.get("nickname", "Unknown"),
-                        "merchant_id": item.get("userId", ""),
                         "price": price,
                         "available_amount": quantity,
                         "min_amount": min_amount,
@@ -110,23 +100,20 @@ async def fetch_bybit_merchants(
                         "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}",
                         "web_link": f"https://www.bybit.com/fiat/trade/otc/detail?advNo={adv_no}"
                     })
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    print(f"⚠️ Parse error: {e}")
                     continue
             
+            print(f"✅ Bybit filtered: {len(merchants)} merchants")
             merchants.sort(key=lambda x: x["price"])
             return merchants[:20]
             
         except Exception as e:
-            print(f"Bybit request error: {e}")
+            print(f"❌ Bybit exception: {e}")
             return []
 
-async def fetch_htx_merchants(
-    crypto: str = "USDT",
-    fiat: str = "RUB",
-    amount: float = 10000,
-    payment_methods: List[str] = ["Tinkoff"]
-) -> List[Dict[str, Any]]:
-    """Запрос к HTX P2P API"""
+async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict]:
+    # HTX часто блокирует запросы, пробуем упрощенный вариант
     coin_map = {"USDT": "2", "BTC": "1", "ETH": "3"}
     currency_map = {"RUB": "11", "USD": "1", "EUR": "2"}
     
@@ -137,27 +124,33 @@ async def fetch_htx_merchants(
         "tradeType": "1",
         "currPage": "1",
         "payMethod": "0",
-        "country": "19",
         "online": "1",
         "amount": str(int(amount))
     }
     
-    async with await get_http_client() as client:
+    print(f"🔍 HTX request: {params}")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Origin": "https://www.htx.com",
+        "Referer": "https://www.htx.com/ru-ru/fiat-crypto/trade"
+    }
+    
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         try:
             response = await client.get(url, params=params)
+            print(f"📡 HTX status: {response.status_code}")
             
             if response.status_code != 200:
                 return []
             
             data = response.json()
-            
-            if data.get("code") != 200:
-                return []
-            
             items = data.get("data", [])
-            merchants = []
+            print(f"✅ HTX found {len(items)} items")
             
-            for item in items:
+            merchants = []
+            for item in items[:20]:
                 try:
                     price = float(item.get("price", 0))
                     min_amount = float(item.get("minTradeLimit", 0))
@@ -175,7 +168,6 @@ async def fetch_htx_merchants(
                         "id": ad_id,
                         "exchange": "htx",
                         "merchant_name": item.get("userName", "Unknown"),
-                        "merchant_id": item.get("uid", ""),
                         "price": price,
                         "available_amount": max_amount,
                         "min_amount": min_amount,
@@ -194,101 +186,76 @@ async def fetch_htx_merchants(
             return merchants[:20]
             
         except Exception as e:
-            print(f"HTX request error: {e}")
+            print(f"❌ HTX exception: {e}")
             return []
 
 @app.get("/api/p2p/merchants")
 async def get_p2p_merchants(
-    crypto: str = Query("USDT", description="Криптовалюта"),
-    fiat: str = Query("RUB", description="Фиатная валюта"),
-    amount: float = Query(10000, description="Сумма"),
-    payment_methods: str = Query("Tinkoff", description="Способы оплаты через запятую")
+    crypto: str = Query("USDT"),
+    fiat: str = Query("RUB"),
+    amount: float = Query(10000),
+    payment_methods: str = Query("Tinkoff")
 ):
-    """Агрегация P2P-предложений"""
+    print(f"🚀 Request: crypto={crypto}, fiat={fiat}, amount={amount}, methods={payment_methods}")
     
     methods = [m.strip() for m in payment_methods.split(",")]
     
-    # Параллельные запросы к биржам
-    tasks = [
-        fetch_bybit_merchants(crypto, fiat, amount, methods),
-        fetch_htx_merchants(crypto, fiat, amount, methods),
-    ]
+    # Запрашиваем обе биржи параллельно
+    bybit_task = fetch_bybit_merchants(crypto, fiat, amount, methods)
+    htx_task = fetch_htx_merchants(crypto, fiat, amount, methods)
     
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    bybit_merchants, htx_merchants = await asyncio.gather(bybit_task, htx_task, return_exceptions=True)
     
-    all_merchants = []
+    if isinstance(bybit_merchants, Exception):
+        print(f"Bybit failed: {bybit_merchants}")
+        bybit_merchants = []
+    if isinstance(htx_merchants, Exception):
+        print(f"HTX failed: {htx_merchants}")
+        htx_merchants = []
+    
+    all_merchants = bybit_merchants + htx_merchants
+    all_merchants.sort(key=lambda x: x["price"])
+    
+    filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
+    
+    best_rate = filtered[0]["price"] if filtered else 0
+    best_exchange = filtered[0]["exchange"] if filtered else "bybit"
+    
     stats = {}
-    
-    # Bybit
-    if not isinstance(results[0], Exception) and results[0]:
-        bybit_merchants = results[0]
-        all_merchants.extend(bybit_merchants)
-        prices = [m["price"] for m in bybit_merchants if m["price"] > 0]
+    if bybit_merchants:
+        prices = [m["price"] for m in bybit_merchants]
         if prices:
             stats["bybit"] = {
                 "exchange": "bybit",
                 "buy_price": min(prices),
-                "sell_price": round(min(prices) * 1.005, 2),
-                "spread": round(min(prices) * 0.005, 2),
-                "spread_percent": 0.5,
                 "merchant_count": len(bybit_merchants),
-                "min_price": min(prices),
-                "max_price": max(prices),
-                "avg_price": round(sum(prices) / len(prices), 2),
-                "total_liquidity": round(sum(m["available_amount"] for m in bybit_merchants), 2)
+                "avg_price": round(sum(prices) / len(prices), 2)
             }
     
-    # HTX
-    if not isinstance(results[1], Exception) and results[1]:
-        htx_merchants = results[1]
-        all_merchants.extend(htx_merchants)
-        prices = [m["price"] for m in htx_merchants if m["price"] > 0]
+    if htx_merchants:
+        prices = [m["price"] for m in htx_merchants]
         if prices:
             stats["htx"] = {
                 "exchange": "htx",
                 "buy_price": min(prices),
-                "sell_price": round(min(prices) * 1.005, 2),
-                "spread": round(min(prices) * 0.005, 2),
-                "spread_percent": 0.5,
                 "merchant_count": len(htx_merchants),
-                "min_price": min(prices),
-                "max_price": max(prices),
-                "avg_price": round(sum(prices) / len(prices), 2),
-                "total_liquidity": round(sum(m["available_amount"] for m in htx_merchants), 2)
+                "avg_price": round(sum(prices) / len(prices), 2)
             }
     
-    # Сортировка всех мерчантов по цене
-    all_merchants.sort(key=lambda x: x["price"])
-    
-    # Фильтрация по доступной сумме
-    filtered_merchants = [
-        m for m in all_merchants
-        if m["available_amount"] >= amount
-        and amount >= m["min_amount"]
-    ][:30]
-    
-    best_rate = filtered_merchants[0]["price"] if filtered_merchants else 0
-    best_exchange = filtered_merchants[0]["exchange"] if filtered_merchants else "bybit"
+    print(f"🎯 Returning {len(filtered)} merchants, best_rate={best_rate}")
     
     return {
-        "merchants": filtered_merchants,
+        "merchants": filtered,
         "stats": stats,
         "best_rate": best_rate,
         "best_exchange": best_exchange,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
 @app.get("/api/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/")
 async def root():
-    return {
-        "name": "P2P Aggregator API",
-        "version": "1.0.0",
-        "endpoints": ["/api/p2p/merchants", "/api/health"]
-    }
+    return {"name": "P2P Aggregator API", "version": "1.0.0"}
