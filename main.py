@@ -342,8 +342,10 @@ async def get_p2p_merchants(
         all_merchants.sort(key=lambda x: x["price"])
     
     if not all_merchants:
-        print("⚠️ No data from exchanges, using mock")
-        all_merchants = await get_mock_merchants(amount)
+    return {
+        "error": "No data from exchanges",
+        "merchants": []
+    }
     
     filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
     
