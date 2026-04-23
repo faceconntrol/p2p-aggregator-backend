@@ -49,14 +49,13 @@ async def fetch_bybit_merchants(
     """Запрос к Bybit P2P API"""
     url = "https://api2.bybit.com/fiat/otc/item/online"
     
-    # Конвертируем способы оплаты
     bybit_payments = [PAYMENT_MAPPING.get(m, m) for m in payment_methods]
     
     payload = {
         "tokenId": crypto,
         "currencyId": fiat,
         "payment": bybit_payments,
-        "side": "0",  # покупка крипты
+        "side": "0",
         "size": "30",
         "page": "1",
         "amount": str(int(amount)),
@@ -115,7 +114,7 @@ async def fetch_bybit_merchants(
                     continue
             
             merchants.sort(key=lambda x: x["price"])
-            return merchants[:20]  # Топ-20
+            return merchants[:20]
             
         except Exception as e:
             print(f"Bybit request error: {e}")
