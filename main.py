@@ -16,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# False = реальные запросы к биржам, True = мок-данные
 USE_MOCK_DATA = False
 
 PAYMENT_MAPPING = {
@@ -29,7 +28,6 @@ PAYMENT_MAPPING = {
 }
 
 async def get_mock_merchants(amount: float) -> List[Dict[str, Any]]:
-    """Тестовые данные для демонстрации"""
     merchants = [
         {
             "id": "bybit_1",
@@ -130,23 +128,23 @@ async def get_mock_merchants(amount: float) -> List[Dict[str, Any]]:
     merchants.sort(key=lambda x: x["price"])
     return merchants
 
-import httpx
-from typing import List, Dict, Any
-
-
 async def fetch_bybit_merchants(
     crypto: str,
     fiat: str,
     amount: float,
     payment_methods: List[str]
 ) -> List[Dict[str, Any]]:
+    """Запрос к Bybit P2P API - работает без авторизации!"""
+    
+    if USE_MOCK_DATA:
+        return []
 
     url = "https://api2.bybit.com/fiat/otc/item/online"
 
     payload = {
         "tokenId": crypto,
         "currencyId": fiat,
-        "side": "1",  # ВАЖНО: 1 = покупка USDT
+        "side": "1",  # 1 = покупка USDT
         "size": "20",
         "page": "1",
         "amount": str(int(amount))
@@ -159,22 +157,26 @@ async def fetch_bybit_merchants(
         "Referer": "https://www.bybit.com/",
         "Content-Type": "application/json",
     }
+    
+    print(f"🔍 Bybit request: {json.dumps(payload)}")
 
     async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         try:
             response = await client.post(url, json=payload)
+            print(f"📡 Bybit status: {response.status_code}")
 
             if response.status_code != 200:
-                print(f"❌ Bybit status: {response.status_code}")
+                print(f"❌ Bybit response: {response.text[:500]}")
                 return []
 
             data = response.json()
-
+            
             if data.get("ret_code") != 0:
                 print(f"❌ Bybit error: {data.get('ret_msg')}")
                 return []
 
             items = data.get("result", {}).get("items", [])
+            print(f"📊 Bybit raw items: {len(items)}")
 
             merchants = []
 
@@ -193,15 +195,15 @@ async def fetch_bybit_merchants(
 
                     payments = item.get("payments", [])
 
-                    # ✅ Фильтр по сумме (ВАЖНО)
+                    # Фильтр по сумме
                     if not (min_amount <= amount <= max_amount):
                         continue
 
-                    # ✅ Фильтр по надёжности
+                    # Фильтр по надёжности
                     if completed_rate < 0.90:
                         continue
 
-                    # ✅ Фильтр по платёжкам (если заданы)
+                    # Фильтр по платёжкам
                     if payment_methods:
                         if not any(pm in payments for pm in payment_methods):
                             continue
@@ -226,9 +228,8 @@ async def fetch_bybit_merchants(
                     print(f"⚠️ parse error: {e}")
                     continue
 
-            # сортировка по цене (лучший курс вверх)
             merchants.sort(key=lambda x: x["price"])
-
+            print(f"✅ Bybit filtered: {len(merchants)} merchants")
             return merchants[:20]
 
         except Exception as e:
@@ -236,7 +237,6 @@ async def fetch_bybit_merchants(
             return []
 
 async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict[str, Any]]:
-    """Запрос к HTX P2P API"""
     if USE_MOCK_DATA:
         return []
     
@@ -320,12 +320,9 @@ async def get_p2p_merchants(
     amount: float = Query(10000),
     payment_methods: str = Query("Tinkoff")
 ):
-    """Агрегация P2P-предложений со всех бирж"""
-    
     methods = [m.strip() for m in payment_methods.split(",")]
     print(f"🚀 Request: {crypto}/{fiat}, {amount} RUB, methods: {methods}")
     
-    # Получаем данные
     if USE_MOCK_DATA:
         all_merchants = await get_mock_merchants(amount)
     else:
@@ -344,18 +341,15 @@ async def get_p2p_merchants(
         all_merchants = bybit_result + htx_result
         all_merchants.sort(key=lambda x: x["price"])
     
-    # Если биржи не вернули данные, используем мок
     if not all_merchants:
         print("⚠️ No data from exchanges, using mock")
         all_merchants = await get_mock_merchants(amount)
     
-    # Фильтруем
     filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
     
     best_rate = filtered[0]["price"] if filtered else 0
     best_exchange = filtered[0]["exchange"] if filtered else "bybit"
     
-    # Статистика по биржам
     stats: Dict[str, Any] = {}
     for m in filtered:
         ex = m["exchange"]
