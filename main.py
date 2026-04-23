@@ -204,9 +204,7 @@ async def fetch_bybit_merchants(
                         continue
 
                     # Фильтр по платёжкам
-                    if payment_methods:
-                        if not any(pm in payments for pm in payment_methods):
-                            continue
+                   
 
                     merchants.append({
                         "id": str(adv_no),
@@ -320,7 +318,7 @@ async def get_p2p_merchants(
     amount: float = Query(10000),
     payment_methods: str = Query("Tinkoff")
 ):
-    methods = [m.strip() for m in payment_methods.split(",")]
+    methods = []
     print(f"🚀 Request: {crypto}/{fiat}, {amount} RUB, methods: {methods}")
     
     if USE_MOCK_DATA:
@@ -342,10 +340,10 @@ async def get_p2p_merchants(
         all_merchants.sort(key=lambda x: x["price"])
     
     if not all_merchants:
-    return {
-        "error": "No data from exchanges",
-        "merchants": []
-    }
+        return {
+            "error": "No data from exchanges",
+            "merchants": []
+        }
     
     filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
     
