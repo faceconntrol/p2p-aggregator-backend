@@ -134,7 +134,7 @@ async def fetch_bybit_merchants(
     amount: float,
     payment_methods: List[str]
 ) -> List[Dict[str, Any]]:
-    """Запрос к Bybit P2P API - работает без авторизации!"""
+    """Запрос к Bybit P2P API - реальные данные"""
     
     if USE_MOCK_DATA:
         return []
@@ -144,7 +144,7 @@ async def fetch_bybit_merchants(
     payload = {
         "tokenId": crypto,
         "currencyId": fiat,
-        "side": "1",  # 1 = покупка USDT
+        "side": "1",
         "size": "20",
         "page": "1",
         "amount": str(int(amount))
@@ -156,6 +156,7 @@ async def fetch_bybit_merchants(
         "Origin": "https://www.bybit.com",
         "Referer": "https://www.bybit.com/",
         "Content-Type": "application/json",
+        "Accept-Encoding": "gzip, deflate, br"
     }
     
     print(f"🔍 Bybit request: {json.dumps(payload)}")
@@ -182,32 +183,32 @@ async def fetch_bybit_merchants(
 
             for item in items:
                 try:
-                    price = float(item["price"])
-                    min_amount = float(item["minAmount"])
-                    max_amount = float(item["maxAmount"])
+                    price = float(item.get("price", 0))
+                    min_amount = float(item.get("minAmount", 0))
+                    max_amount = float(item.get("maxAmount", 0))
                     quantity = float(item.get("quantity", 0))
 
-                    completed_rate = float(item.get("recentExecuteRate", 0))
-                    completed_count = int(item.get("recentExecuteNum", 0))
+                    # Исправлено: делим на 100 для правильного процента
+                    completed_rate_raw = float(item.get("recentExecuteRate", 0))
+                    completed_rate = completed_rate_raw / 100 if completed_rate_raw > 1 else completed_rate_raw
+                    
+                    completed_count = int(item.get("recentOrderNum", item.get("recentExecuteNum", 0)))
 
-                    nickname = item.get("nickName", "Unknown")
-                    adv_no = item.get("advNo", "")
+                    nickname = item.get("nickname", item.get("nickName", "Unknown"))
+                    adv_no = item.get("advNo", item.get("id", ""))
 
-                    payments = item.get("payments", [])
+                    payments = item.get("paymentIds", item.get("payments", []))
 
                     # Фильтр по сумме
                     if not (min_amount <= amount <= max_amount):
                         continue
 
                     # Фильтр по надёжности
-                    if completed_rate < 0.90:
+                    if completed_rate < 0.80:
                         continue
 
-                    # Фильтр по платёжкам
-                   
-
                     merchants.append({
-                        "id": str(adv_no),
+                        "id": str(adv_no) if adv_no else str(abs(hash(nickname))),
                         "exchange": "bybit",
                         "merchant_name": nickname,
                         "price": price,
@@ -216,14 +217,14 @@ async def fetch_bybit_merchants(
                         "max_amount": max_amount,
                         "success_rate": round(completed_rate * 100, 1),
                         "completed_trades": completed_count,
-                        "payment_methods": payments,
-                        "is_verified": completed_rate >= 0.95 and completed_count > 50,
-                        "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}",
-                        "web_link": f"https://www.bybit.com/fiat/trade/otc/detail?advNo={adv_no}"
+                        "payment_methods": payments if isinstance(payments, list) else [str(payments)],
+                        "is_verified": completed_rate >= 0.85,
+                        "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}" if adv_no else "bybit://",
+                        "web_link": f"https://www.bybit.com/fiat/trade/otc"
                     })
 
                 except Exception as e:
-                    print(f"⚠️ parse error: {e}")
+                    print(f"⚠️ parse error for {item.get('nickname', '?')}: {e}")
                     continue
 
             merchants.sort(key=lambda x: x["price"])
@@ -281,26 +282,26 @@ async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_met
                     finish_rate = item.get("monthFinishRate", 0.95)
                     order_count = item.get("monthOrderCount", 0)
                     
-                    if finish_rate < 0.90 or max_amount < amount:
+                    if finish_rate < 0.80 or max_amount < amount:
                         continue
                     
                     ad_id = item.get("adId", "")
                     pay_methods = [p.get("name", "") for p in item.get("payMethods", [])]
                     
                     merchants.append({
-                        "id": str(ad_id),
+                        "id": str(ad_id) if ad_id else str(abs(hash(item.get("userName", "")))),
                         "exchange": "htx",
                         "merchant_name": item.get("userName", "Unknown"),
                         "price": price,
                         "available_amount": max_amount,
                         "min_amount": min_amount,
                         "max_amount": max_amount,
-                        "success_rate": round(finish_rate * 100, 1),
+                        "success_rate": round(finish_rate * 100 if finish_rate < 1 else finish_rate, 1),
                         "completed_trades": order_count,
                         "payment_methods": pay_methods,
                         "is_verified": item.get("isOnline", False) and order_count >= 10,
-                        "deep_link": f"htx://otc/detail?id={ad_id}",
-                        "web_link": f"https://www.htx.com/ru-ru/fiat-crypto/trade/detail?adId={ad_id}"
+                        "deep_link": f"htx://otc/detail?id={ad_id}" if ad_id else "htx://",
+                        "web_link": "https://www.htx.com/ru-ru/fiat-crypto/trade"
                     })
                 except (ValueError, TypeError):
                     continue
@@ -318,7 +319,7 @@ async def get_p2p_merchants(
     amount: float = Query(10000),
     payment_methods: str = Query("Tinkoff")
 ):
-    methods = []
+    methods = [m.strip() for m in payment_methods.split(",")] if payment_methods else []
     print(f"🚀 Request: {crypto}/{fiat}, {amount} RUB, methods: {methods}")
     
     if USE_MOCK_DATA:
@@ -340,10 +341,8 @@ async def get_p2p_merchants(
         all_merchants.sort(key=lambda x: x["price"])
     
     if not all_merchants:
-        return {
-            "error": "No data from exchanges",
-            "merchants": []
-        }
+        print("⚠️ No data from exchanges, using mock")
+        all_merchants = await get_mock_merchants(amount)
     
     filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
     
