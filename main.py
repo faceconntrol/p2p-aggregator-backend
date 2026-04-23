@@ -169,128 +169,6 @@ async def fetch_bybit_merchants(
             return []
 
 # ═══════════════════════════════════════════
-# BITGET P2P API
-# ═══════════════════════════════════════════
-async def fetch_bitget_merchants(
-    crypto: str, fiat: str, amount: float, methods: List[str]
-) -> List[Dict[str, Any]]:
-
-    urls = [
-        "https://api.bitget.com/api/v2/p2p/advertise/queryList",
-        "https://api.bitget.com/api/v2/p2p/merchant/advList",
-    ]
-    
-    for url in urls:
-        print(f"🔍 Trying Bitget: {url}")
-        
-        payload = {
-            "coin": crypto,
-            "currency": fiat,
-            "side": "buy",
-            "pageNo": "1",
-            "pageSize": "20",
-            "amount": str(int(amount)),
-            "payMethod": []
-        }
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Origin": "https://www.bitget.com",
-            "Referer": "https://www.bitget.com/ru/p2p",
-            "locale": "ru-RU"
-        }
-
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-            try:
-                response = await client.post(url, json=payload)
-                print(f"📡 Bitget status: {response.status_code}")
-
-                if response.status_code == 200:
-                    data = response.json()
-                    print(f"📦 Bitget keys: {data.keys() if isinstance(data, dict) else type(data)}")
-                    
-                    items = None
-                    if isinstance(data, dict):
-                        if data.get("code") == "00000":
-                            result = data.get("data", {})
-                            items = result.get("list", result.get("data", []))
-                        elif "data" in data:
-                            items = data["data"]
-                    
-                    if items and len(items) > 0:
-                        print(f"  ✅ Bitget: {len(items)} items")
-                        return parse_bitget_items(items, amount, methods)
-                    
-                    print(f"  ❌ Bitget: no items in response")
-                else:
-                    print(f"  ❌ Bitget: {response.status_code}")
-            except Exception as e:
-                print(f"  ❌ Bitget exception: {e}")
-    
-    return []
-
-def parse_bitget_items(items: List[Dict], amount: float, methods: List[str]) -> List[Dict[str, Any]]:
-    merchants = []
-    for item in items:
-        try:
-            adv = item.get("advertisement", item)
-            user = item.get("advertiser", item)
-            
-            price = float(adv.get("price", 0))
-            min_amount = float(adv.get("minTradeAmount", adv.get("minAmount", 0)))
-            max_amount = float(adv.get("maxTradeAmount", adv.get("maxAmount", 0)))
-            available = float(adv.get("surplusAmount", adv.get("amount", 0)))
-            
-            rate_str = str(user.get("userRate", user.get("completedRate", "95"))).replace("%", "")
-            success_rate = float(rate_str)
-            trades = int(user.get("orderCount", adv.get("orderCompleteCount", 0)))
-            
-            nickname = user.get("nickName", adv.get("nickName", "Unknown"))
-            adv_no = adv.get("advertisementId", adv.get("advNo", ""))
-            
-            pay_methods = []
-            pay_list = adv.get("payMethodList", adv.get("payMethods", []))
-            for p in pay_list:
-                if isinstance(p, dict):
-                    pay_methods.append(p.get("name", ""))
-                else:
-                    pay_methods.append(str(p))
-            
-            if amount < min_amount or amount > max_amount:
-                continue
-            if success_rate < 50:
-                continue
-            if methods:
-                methods_lower = [m.lower() for m in methods]
-                pay_lower = [p.lower() for p in pay_methods]
-                if not any(m in pay_lower for m in methods_lower):
-                    continue
-            
-            merchants.append({
-                "id": str(adv_no),
-                "exchange": "bitget",
-                "merchant_name": nickname,
-                "price": price,
-                "available_amount": available,
-                "min_amount": min_amount,
-                "max_amount": max_amount,
-                "success_rate": success_rate,
-                "completed_trades": trades,
-                "payment_methods": pay_methods,
-                "is_verified": trades >= 10 and success_rate >= 85,
-                "deep_link": f"https://www.bitget.com/ru/p2p/detail?advNo={adv_no}" if adv_no else "https://www.bitget.com/ru/p2p",
-                "web_link": "https://www.bitget.com/ru/p2p"
-            })
-        except Exception as e:
-            print(f"⚠️ Bitget parse: {e}")
-            continue
-    
-    merchants.sort(key=lambda m: score_merchant(m, amount))
-    return merchants[:15]
-
-# ═══════════════════════════════════════════
 # HTX P2P API (ИСПРАВЛЕННЫЙ)
 # ═══════════════════════════════════════════
 async def fetch_htx_merchants(
@@ -304,12 +182,12 @@ async def fetch_htx_merchants(
     params = {
         "coinId": coin_map.get(crypto, "2"),
         "currency": currency_map.get(fiat, "11"),
-        "tradeType": "buy",       # ✅ ИСПРАВЛЕНО
+        "tradeType": "buy",
         "currPage": "1",
         "payMethod": "0",
         "online": "1",
         "amount": str(int(amount)),
-        "blockType": "general",   # ✅ ДОБАВЛЕНО
+        "blockType": "general",
     }
     
     headers = {
@@ -331,11 +209,23 @@ async def fetch_htx_merchants(
                 return []
             
             data = response.json()
-            print(f"📦 HTX keys: {data.keys() if isinstance(data, dict) else type(data)}")
-            print(f"📦 HTX code: {data.get('code')}, message: {data.get('message', '')}")
+            print(f"📦 HTX success: {data.get('success')}, code: {data.get('code')}")
             
-            if data.get("code") == 200:
+            # НОВАЯ СТРУКТУРА ОТВЕТА HTX
+            if data.get("success") and data.get("code") == 200:
                 items = data.get("data", [])
+                
+                # data может быть списком или словарём
+                if isinstance(items, dict):
+                    # Пробуем разные ключи
+                    items = items.get("data", items.get("list", items.get("items", [])))
+                
+                if not items or not isinstance(items, list):
+                    print(f"  ❌ HTX: no items or wrong format. Type: {type(items)}")
+                    if isinstance(items, dict):
+                        print(f"  📦 HTX data keys: {items.keys()}")
+                    return []
+                
                 print(f"📊 HTX: {len(items)} items")
                 
                 merchants = []
@@ -355,11 +245,12 @@ async def fetch_htx_merchants(
                         
                         pay_raw = item.get("payMethods", item.get("payments", []))
                         pay_methods = []
-                        for p in pay_raw:
-                            if isinstance(p, dict):
-                                pay_methods.append(p.get("name", ""))
-                            else:
-                                pay_methods.append(str(p))
+                        if isinstance(pay_raw, list):
+                            for p in pay_raw:
+                                if isinstance(p, dict):
+                                    pay_methods.append(p.get("name", ""))
+                                else:
+                                    pay_methods.append(str(p))
                         
                         if methods:
                             methods_lower = [m.lower() for m in methods]
@@ -390,109 +281,11 @@ async def fetch_htx_merchants(
                 print(f"  ✅ HTX ranked: {len(merchants)}")
                 return merchants[:15]
             else:
-                print(f"  ❌ HTX error: code={data.get('code')}")
+                print(f"  ❌ HTX: success={data.get('success')}, code={data.get('code')}")
                 return []
             
         except Exception as e:
             print(f"❌ HTX exception: {e}")
-            return []
-
-# ═══════════════════════════════════════════
-# GATE.IO P2P API
-# ═══════════════════════════════════════════
-async def fetch_gateio_merchants(
-    crypto: str, fiat: str, amount: float, methods: List[str]
-) -> List[Dict[str, Any]]:
-    
-    url = "https://www.gate.io/api/p2p/advertise/list"
-    params = {
-        "crypto": crypto,
-        "fiat": fiat,
-        "type": "buy",
-        "page": "1",
-        "limit": "20",
-        "amount": str(int(amount))
-    }
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Origin": "https://www.gate.io",
-        "Referer": "https://www.gate.io/ru/p2p",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Connection": "keep-alive",
-    }
-
-    async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
-        try:
-            response = await client.get(url, params=params)
-            print(f"📡 Gate.io status: {response.status_code}")
-            
-            if response.status_code != 200:
-                print(f"❌ Gate.io response: {response.text[:200]}")
-                return []
-            
-            data = response.json()
-            
-            items = data.get("list", data.get("data", data.get("result", [])))
-            if isinstance(items, dict):
-                items = items.get("list", [])
-            
-            if not items:
-                return []
-            
-            print(f"📊 Gate.io: {len(items)} items")
-            
-            merchants = []
-            for item in items:
-                try:
-                    price = float(item.get("price", 0))
-                    min_amount = float(item.get("minAmount", 0))
-                    max_amount = float(item.get("maxAmount", 0))
-                    available = float(item.get("amount", 0))
-                    
-                    rate = float(str(item.get("completedRate", "95")).replace("%", ""))
-                    trades = int(item.get("tradeCount", 0))
-                    nickname = item.get("nickname", "Unknown")
-                    ad_id = str(item.get("id", ""))
-                    pay_methods = item.get("payMethods", [])
-                    
-                    if amount < min_amount or amount > max_amount:
-                        continue
-                    if rate < 50:
-                        continue
-                    if methods:
-                        methods_lower = [m.lower() for m in methods]
-                        pay_lower = [p.lower() for p in pay_methods]
-                        if not any(m in pay_lower for m in methods_lower):
-                            continue
-                    
-                    merchants.append({
-                        "id": ad_id,
-                        "exchange": "gateio",
-                        "merchant_name": nickname,
-                        "price": price,
-                        "available_amount": available,
-                        "min_amount": min_amount,
-                        "max_amount": max_amount,
-                        "success_rate": rate,
-                        "completed_trades": trades,
-                        "payment_methods": pay_methods,
-                        "is_verified": trades >= 10 and rate >= 85,
-                        "deep_link": f"https://www.gate.io/ru/p2p/detail?id={ad_id}" if ad_id else "https://www.gate.io/ru/p2p",
-                        "web_link": "https://www.gate.io/ru/p2p"
-                    })
-                except Exception:
-                    continue
-            
-            merchants.sort(key=lambda m: score_merchant(m, amount))
-            print(f"  ✅ Gate.io ranked: {len(merchants)}")
-            return merchants[:15]
-            
-        except Exception as e:
-            print(f"❌ Gate.io exception: {e}")
             return []
 
 # ═══════════════════════════════════════════
@@ -515,11 +308,10 @@ async def get_p2p_merchants(
             print(f"📦 Returning cached data")
             return cached_data
     
+    # Только рабочие биржи
     tasks = [
         fetch_bybit_merchants(crypto, fiat, amount, methods),
-        fetch_bitget_merchants(crypto, fiat, amount, methods),
         fetch_htx_merchants(crypto, fiat, amount, methods),
-        fetch_gateio_merchants(crypto, fiat, amount, methods),
     ]
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -580,4 +372,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"name": "P2P Aggregator API", "version": "2.0.0", "exchanges": ["bybit", "bitget", "htx", "gateio"]}
+    return {"name": "P2P Aggregator API", "version": "2.0.0", "exchanges": ["bybit", "htx"]}
