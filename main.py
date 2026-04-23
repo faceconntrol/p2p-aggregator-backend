@@ -16,6 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Флаг для использования мок-данных (пока Bybit API не работает)
+USE_MOCK_DATA = True
+
 PAYMENT_MAPPING = {
     "Sberbank": "Sberbank",
     "Tinkoff": "TinkoffNew",
@@ -26,6 +29,9 @@ PAYMENT_MAPPING = {
 }
 
 async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict]:
+    if USE_MOCK_DATA:
+        return []
+    
     url = "https://api2.bybit.com/fiat/otc/item/online"
     bybit_payments = [PAYMENT_MAPPING.get(m, m) for m in payment_methods]
     
@@ -62,40 +68,48 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_m
                 return []
             
             data = response.json()
-            print(f"📦 Bybit retCode: {data.get('retCode')}, retMsg: {data.get('retMsg')}")
+            print(f"📦 Bybit raw response keys: {data.keys()}")
+            print(f"📦 Bybit raw response: {json.dumps(data)[:1000]}")
             
-            if data.get("retCode") != 0:
+            # Пробуем разные форматы ответа
+            items = None
+            if "result" in data and data["result"]:
+                items = data["result"].get("items", [])
+            elif "data" in data and data["data"]:
+                items = data["data"].get("list", [])
+            
+            if not items:
+                print(f"❌ Bybit: no items found in response")
                 return []
             
-            items = data.get("result", {}).get("items", [])
             print(f"✅ Bybit found {len(items)} items")
             
             merchants = []
             for item in items:
                 try:
                     price = float(item.get("price", 0))
-                    quantity = float(item.get("quantity", 0))
-                    min_amount = float(item.get("minAmount", 0))
-                    max_amount = float(item.get("maxAmount", 0))
-                    completed_rate = float(item.get("completedRate", "0.95"))
-                    completed_count = item.get("completedCount", 0)
+                    quantity = float(item.get("quantity", item.get("amount", 0)))
+                    min_amount = float(item.get("minAmount", item.get("minTradeAmount", 0)))
+                    max_amount = float(item.get("maxAmount", item.get("maxTradeAmount", 0)))
+                    completed_rate = float(item.get("completedRate", item.get("finishRate", "0.95")))
+                    completed_count = item.get("completedCount", item.get("orderCount", 0))
                     
                     if completed_rate < 0.90 or quantity < amount:
                         continue
                     
-                    adv_no = item.get("advNo", "")
+                    adv_no = item.get("advNo") or item.get("id", "")
                     
                     merchants.append({
-                        "id": adv_no,
+                        "id": str(adv_no),
                         "exchange": "bybit",
-                        "merchant_name": item.get("nickname", "Unknown"),
+                        "merchant_name": item.get("nickname", item.get("userName", "Unknown")),
                         "price": price,
                         "available_amount": quantity,
                         "min_amount": min_amount,
                         "max_amount": max_amount,
                         "success_rate": round(completed_rate * 100, 1),
                         "completed_trades": completed_count,
-                        "payment_methods": item.get("payments", []),
+                        "payment_methods": item.get("payments", item.get("payMethods", [])),
                         "is_verified": completed_count >= 10 and completed_rate >= 0.90,
                         "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}",
                         "web_link": f"https://www.bybit.com/fiat/trade/otc/detail?advNo={adv_no}"
@@ -113,7 +127,9 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_m
             return []
 
 async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict]:
-    # HTX часто блокирует запросы, пробуем упрощенный вариант
+    if USE_MOCK_DATA:
+        return []
+    
     coin_map = {"USDT": "2", "BTC": "1", "ETH": "3"}
     currency_map = {"RUB": "11", "USD": "1", "EUR": "2"}
     
@@ -147,7 +163,8 @@ async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_met
             
             data = response.json()
             items = data.get("data", [])
-            print(f"✅ HTX found {len(items)} items")
+            if not items:
+                return []
             
             merchants = []
             for item in items[:20]:
@@ -165,7 +182,7 @@ async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_met
                     pay_methods = [p.get("name", "") for p in item.get("payMethods", [])]
                     
                     merchants.append({
-                        "id": ad_id,
+                        "id": str(ad_id),
                         "exchange": "htx",
                         "merchant_name": item.get("userName", "Unknown"),
                         "price": price,
@@ -189,6 +206,105 @@ async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, payment_met
             print(f"❌ HTX exception: {e}")
             return []
 
+def get_mock_merchants(amount: float) -> List[Dict]:
+    """Возвращает тестовые данные для демонстрации"""
+    merchants = [
+        {
+            "id": "bybit_1",
+            "exchange": "bybit",
+            "merchant_name": "CryptoPro",
+            "price": 96.85,
+            "available_amount": 150000,
+            "min_amount": 5000,
+            "max_amount": 500000,
+            "success_rate": 98.5,
+            "completed_trades": 2340,
+            "payment_methods": ["Tinkoff", "Sberbank"],
+            "is_verified": True,
+            "deep_link": "bybit://fiat/otc/detail?advNo=1",
+            "web_link": "https://www.bybit.com/fiat/trade/otc"
+        },
+        {
+            "id": "bybit_2",
+            "exchange": "bybit",
+            "merchant_name": "FastMoney",
+            "price": 97.10,
+            "available_amount": 80000,
+            "min_amount": 3000,
+            "max_amount": 300000,
+            "success_rate": 96.8,
+            "completed_trades": 890,
+            "payment_methods": ["Tinkoff", "Raiffeisen"],
+            "is_verified": True,
+            "deep_link": "bybit://fiat/otc/detail?advNo=2",
+            "web_link": "https://www.bybit.com/fiat/trade/otc"
+        },
+        {
+            "id": "bybit_3",
+            "exchange": "bybit",
+            "merchant_name": "RubleExchange",
+            "price": 96.50,
+            "available_amount": 250000,
+            "min_amount": 10000,
+            "max_amount": 1000000,
+            "success_rate": 99.1,
+            "completed_trades": 5600,
+            "payment_methods": ["Sberbank", "VTB"],
+            "is_verified": True,
+            "deep_link": "bybit://fiat/otc/detail?advNo=3",
+            "web_link": "https://www.bybit.com/fiat/trade/otc"
+        },
+        {
+            "id": "htx_1",
+            "exchange": "htx",
+            "merchant_name": "HuobiTrader",
+            "price": 97.45,
+            "available_amount": 120000,
+            "min_amount": 5000,
+            "max_amount": 400000,
+            "success_rate": 97.2,
+            "completed_trades": 1200,
+            "payment_methods": ["Tinkoff", "AlfaBank"],
+            "is_verified": True,
+            "deep_link": "htx://otc/detail?id=1",
+            "web_link": "https://www.htx.com/ru-ru/fiat-crypto/trade"
+        },
+        {
+            "id": "htx_2",
+            "exchange": "htx",
+            "merchant_name": "CryptoKing",
+            "price": 98.00,
+            "available_amount": 60000,
+            "min_amount": 2000,
+            "max_amount": 200000,
+            "success_rate": 95.5,
+            "completed_trades": 450,
+            "payment_methods": ["Sberbank"],
+            "is_verified": True,
+            "deep_link": "htx://otc/detail?id=2",
+            "web_link": "https://www.htx.com/ru-ru/fiat-crypto/trade"
+        },
+        {
+            "id": "bitget_1",
+            "exchange": "bitget",
+            "merchant_name": "BitgetPro",
+            "price": 96.95,
+            "available_amount": 90000,
+            "min_amount": 3000,
+            "max_amount": 350000,
+            "success_rate": 96.0,
+            "completed_trades": 780,
+            "payment_methods": ["Tinkoff", "Raiffeisen"],
+            "is_verified": True,
+            "deep_link": "bitget://p2p/detail?advNo=1",
+            "web_link": "https://www.bitget.com/ru/p2p"
+        }
+    ]
+    
+    # Сортируем по цене
+    merchants.sort(key=lambda x: x["price"])
+    return merchants
+
 @app.get("/api/p2p/merchants")
 async def get_p2p_merchants(
     crypto: str = Query("USDT"),
@@ -200,47 +316,38 @@ async def get_p2p_merchants(
     
     methods = [m.strip() for m in payment_methods.split(",")]
     
-    # Запрашиваем обе биржи параллельно
-    bybit_task = fetch_bybit_merchants(crypto, fiat, amount, methods)
-    htx_task = fetch_htx_merchants(crypto, fiat, amount, methods)
+    # Получаем данные
+    if USE_MOCK_DATA:
+        all_merchants = get_mock_merchants(amount)
+    else:
+        bybit_merchants = await fetch_bybit_merchants(crypto, fiat, amount, methods)
+        htx_merchants = await fetch_htx_merchants(crypto, fiat, amount, methods)
+        all_merchants = bybit_merchants + htx_merchants
+        all_merchants.sort(key=lambda x: x["price"])
     
-    bybit_merchants, htx_merchants = await asyncio.gather(bybit_task, htx_task, return_exceptions=True)
-    
-    if isinstance(bybit_merchants, Exception):
-        print(f"Bybit failed: {bybit_merchants}")
-        bybit_merchants = []
-    if isinstance(htx_merchants, Exception):
-        print(f"HTX failed: {htx_merchants}")
-        htx_merchants = []
-    
-    all_merchants = bybit_merchants + htx_merchants
-    all_merchants.sort(key=lambda x: x["price"])
-    
+    # Фильтруем по доступной сумме
     filtered = [m for m in all_merchants if m["available_amount"] >= amount and amount >= m["min_amount"]][:30]
     
     best_rate = filtered[0]["price"] if filtered else 0
     best_exchange = filtered[0]["exchange"] if filtered else "bybit"
     
+    # Статистика по биржам
     stats = {}
-    if bybit_merchants:
-        prices = [m["price"] for m in bybit_merchants]
-        if prices:
-            stats["bybit"] = {
-                "exchange": "bybit",
-                "buy_price": min(prices),
-                "merchant_count": len(bybit_merchants),
-                "avg_price": round(sum(prices) / len(prices), 2)
+    for m in filtered:
+        ex = m["exchange"]
+        if ex not in stats:
+            stats[ex] = {
+                "exchange": ex,
+                "prices": [],
+                "merchant_count": 0
             }
+        stats[ex]["prices"].append(m["price"])
     
-    if htx_merchants:
-        prices = [m["price"] for m in htx_merchants]
-        if prices:
-            stats["htx"] = {
-                "exchange": "htx",
-                "buy_price": min(prices),
-                "merchant_count": len(htx_merchants),
-                "avg_price": round(sum(prices) / len(prices), 2)
-            }
+    for ex, data in stats.items():
+        prices = data.pop("prices")
+        data["buy_price"] = min(prices)
+        data["merchant_count"] = len(prices)
+        data["avg_price"] = round(sum(prices) / len(prices), 2)
     
     print(f"🎯 Returning {len(filtered)} merchants, best_rate={best_rate}")
     
@@ -258,4 +365,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"name": "P2P Aggregator API", "version": "1.0.0"}
+    return {"name": "P2P Aggregator API", "version": "1.0.0", "mock_data": USE_MOCK_DATA}
