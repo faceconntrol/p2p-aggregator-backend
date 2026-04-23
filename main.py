@@ -130,106 +130,107 @@ async def get_mock_merchants(amount: float) -> List[Dict[str, Any]]:
     merchants.sort(key=lambda x: x["price"])
     return merchants
 
-async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_methods: List[str]) -> List[Dict[str, Any]]:
-    """Запрос к Bybit P2P API"""
-    if USE_MOCK_DATA:
-        return []
-    
+import httpx
+from typing import List, Dict, Any
+
+
+async def fetch_bybit_merchants(
+    crypto: str,
+    fiat: str,
+    amount: float,
+    payment_methods: List[str]
+) -> List[Dict[str, Any]]:
+
     url = "https://api2.bybit.com/fiat/otc/item/online"
-    
-    bybit_payments = [PAYMENT_MAPPING.get(m, m) for m in payment_methods]
-    
+
     payload = {
-        "userId": "",
         "tokenId": crypto,
         "currencyId": fiat,
-        "payment": bybit_payments,
-        "side": "0",
+        "side": "1",  # ВАЖНО: 1 = покупка USDT
         "size": "20",
         "page": "1",
-        "amount": str(int(amount)),
-        "authMaker": False,
-        "canTrade": True,
-        "bulkMaker": False,
-        "instantOrder": False
+        "amount": str(int(amount))
     }
-    
-    print(f"🔍 Bybit request: {json.dumps(payload)}")
-    
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin": "https://www.bybit.com",
         "Referer": "https://www.bybit.com/",
         "Content-Type": "application/json",
     }
-    
-    async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         try:
             response = await client.post(url, json=payload)
-            print(f"📡 Bybit status: {response.status_code}")
-            
+
             if response.status_code != 200:
-                print(f"❌ Bybit response: {response.text[:500]}")
+                print(f"❌ Bybit status: {response.status_code}")
                 return []
-            
+
             data = response.json()
-            print(f"📦 Bybit ret_code: {data.get('ret_code')}, ret_msg: {data.get('ret_msg')}")
-            
+
             if data.get("ret_code") != 0:
                 print(f"❌ Bybit error: {data.get('ret_msg')}")
                 return []
-            
+
             items = data.get("result", {}).get("items", [])
-            
-            if not items:
-                print("⚠️ Bybit returned empty items")
-                return []
-            
-            print(f"📊 Bybit: {len(items)} items")
-            
+
             merchants = []
+
             for item in items:
                 try:
-                    price = float(item.get("price", 0))
+                    price = float(item["price"])
+                    min_amount = float(item["minAmount"])
+                    max_amount = float(item["maxAmount"])
                     quantity = float(item.get("quantity", 0))
-                    min_amount = float(item.get("minAmount", 0))
-                    max_amount = float(item.get("maxAmount", 0))
-                    completed_rate = float(item.get("completedRate", "0.95"))
-                    completed_count = int(item.get("completedCount", 0))
-                    
-                    if completed_rate < 0.90 or quantity < amount:
-                        continue
-                    
+
+                    completed_rate = float(item.get("recentExecuteRate", 0))
+                    completed_count = int(item.get("recentExecuteNum", 0))
+
+                    nickname = item.get("nickName", "Unknown")
                     adv_no = item.get("advNo", "")
-                    nickname = item.get("nickname", "Unknown")
+
                     payments = item.get("payments", [])
-                    
+
+                    # ✅ Фильтр по сумме (ВАЖНО)
+                    if not (min_amount <= amount <= max_amount):
+                        continue
+
+                    # ✅ Фильтр по надёжности
+                    if completed_rate < 0.90:
+                        continue
+
+                    # ✅ Фильтр по платёжкам (если заданы)
+                    if payment_methods:
+                        if not any(pm in payments for pm in payment_methods):
+                            continue
+
                     merchants.append({
                         "id": str(adv_no),
                         "exchange": "bybit",
-                        "merchant_name": str(nickname),
+                        "merchant_name": nickname,
                         "price": price,
                         "available_amount": quantity,
                         "min_amount": min_amount,
                         "max_amount": max_amount,
                         "success_rate": round(completed_rate * 100, 1),
                         "completed_trades": completed_count,
-                        "payment_methods": payments if isinstance(payments, list) else [payments],
-                        "is_verified": completed_count >= 10 and completed_rate >= 0.90,
+                        "payment_methods": payments,
+                        "is_verified": completed_rate >= 0.95 and completed_count > 50,
                         "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}",
                         "web_link": f"https://www.bybit.com/fiat/trade/otc/detail?advNo={adv_no}"
                     })
-                    
-                except (ValueError, TypeError) as e:
-                    print(f"⚠️ Parse error: {e}")
+
+                except Exception as e:
+                    print(f"⚠️ parse error: {e}")
                     continue
-            
+
+            # сортировка по цене (лучший курс вверх)
             merchants.sort(key=lambda x: x["price"])
-            print(f"✅ Bybit filtered: {len(merchants)} merchants")
+
             return merchants[:20]
-            
+
         except Exception as e:
             print(f"❌ Bybit exception: {e}")
             return []
