@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Флаг для использования мок-данных (пока Bybit API не работает)
+# False = реальные запросы к биржам, True = мок-данные
 USE_MOCK_DATA = False
 
 PAYMENT_MAPPING = {
@@ -136,90 +136,75 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_m
         return []
     
     url = "https://api2.bybit.com/fiat/otc/item/online"
+    
     bybit_payments = [PAYMENT_MAPPING.get(m, m) for m in payment_methods]
     
     payload = {
+        "userId": "",
         "tokenId": crypto,
         "currencyId": fiat,
         "payment": bybit_payments,
         "side": "0",
-        "size": "30",
+        "size": "20",
         "page": "1",
         "amount": str(int(amount)),
         "authMaker": False,
-        "canTrade": True
+        "canTrade": True,
+        "bulkMaker": False,
+        "instantOrder": False
     }
     
     print(f"🔍 Bybit request: {json.dumps(payload)}")
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "ru-RU,ru;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin": "https://www.bybit.com",
-        "Referer": "https://www.bybit.com/fiat/trade/otc",
-        "Content-Type": "application/json"
+        "Referer": "https://www.bybit.com/",
+        "Content-Type": "application/json",
     }
     
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
         try:
             response = await client.post(url, json=payload)
             print(f"📡 Bybit status: {response.status_code}")
             
             if response.status_code != 200:
+                print(f"❌ Bybit response: {response.text[:500]}")
                 return []
             
             data = response.json()
-            print(f"📦 Bybit keys: {data.keys()}")
-            print(f"📦 Bybit raw: {json.dumps(data, ensure_ascii=False)[:1500]}")
+            print(f"📦 Bybit ret_code: {data.get('ret_code')}, ret_msg: {data.get('ret_msg')}")
             
-            merchants = []
-            items = None
+            if data.get("ret_code") != 0:
+                print(f"❌ Bybit error: {data.get('ret_msg')}")
+                return []
             
-            # Пробуем разные форматы ответа
-            if "result" in data and isinstance(data["result"], dict) and "items" in data["result"]:
-                items = data["result"]["items"]
-            elif "data" in data and isinstance(data["data"], dict) and "list" in data["data"]:
-                items = data["data"]["list"]
-            elif "data" in data and isinstance(data["data"], list):
-                items = data["data"]
-            elif isinstance(data, list):
-                items = data
+            items = data.get("result", {}).get("items", [])
             
             if not items:
-                print(f"❌ Bybit: no items found. Keys: {list(data.keys())}")
+                print("⚠️ Bybit returned empty items")
                 return []
             
             print(f"📊 Bybit: {len(items)} items")
             
+            merchants = []
             for item in items:
                 try:
                     price = float(item.get("price", 0))
-                    quantity = float(item.get("quantity", item.get("amount", item.get("maxAmount", 0))))
-                    min_amount = float(item.get("minAmount", item.get("minTradeLimit", 0)))
-                    max_amount = float(item.get("maxAmount", item.get("maxTradeLimit", 0)))
-                    
-                    completed_rate = 0.95
-                    for key in ["completedRate", "finishRate", "completionRate", "monthFinishRate"]:
-                        if key in item and item[key]:
-                            completed_rate = float(item[key])
-                            break
-                    
-                    completed_count = 0
-                    for key in ["completedCount", "orderCount", "monthOrderCount", "tradeCount"]:
-                        if key in item and item[key]:
-                            completed_count = int(item[key])
-                            break
+                    quantity = float(item.get("quantity", 0))
+                    min_amount = float(item.get("minAmount", 0))
+                    max_amount = float(item.get("maxAmount", 0))
+                    completed_rate = float(item.get("completedRate", "0.95"))
+                    completed_count = int(item.get("completedCount", 0))
                     
                     if completed_rate < 0.90 or quantity < amount:
                         continue
                     
-                    adv_no = item.get("advNo") or item.get("id") or item.get("adId") or ""
-                    nickname = item.get("nickname") or item.get("userName") or item.get("merchantName") or "Unknown"
-                    payments = item.get("payments") or item.get("payMethods") or []
-                    
-                    if isinstance(payments, str):
-                        payments = [payments]
+                    adv_no = item.get("advNo", "")
+                    nickname = item.get("nickname", "Unknown")
+                    payments = item.get("payments", [])
                     
                     merchants.append({
                         "id": str(adv_no),
@@ -229,9 +214,9 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, payment_m
                         "available_amount": quantity,
                         "min_amount": min_amount,
                         "max_amount": max_amount,
-                        "success_rate": round(completed_rate * 100 if completed_rate < 1 else completed_rate, 1),
+                        "success_rate": round(completed_rate * 100, 1),
                         "completed_trades": completed_count,
-                        "payment_methods": payments,
+                        "payment_methods": payments if isinstance(payments, list) else [payments],
                         "is_verified": completed_count >= 10 and completed_rate >= 0.90,
                         "deep_link": f"bybit://fiat/otc/detail?advNo={adv_no}",
                         "web_link": f"https://www.bybit.com/fiat/trade/otc/detail?advNo={adv_no}"
