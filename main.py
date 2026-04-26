@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from datetime import datetime, timezone
 import json
 import time
@@ -18,122 +18,120 @@ app.add_middleware(
 )
 
 # ═══════════════════════════════════════════
-# КЭШ + ИСТОРИЯ ЦЕН (для трендов)
+# КЭШ
 # ═══════════════════════════════════════════
 CACHE: Dict[str, tuple] = {}
 CACHE_TTL = 10
-PRICE_HISTORY: Dict[str, List[float]] = {}  # Для отслеживания трендов
 
 # ═══════════════════════════════════════════
-# ВЕСА БИРЖ (доверие к площадке)
-# ═══════════════════════════════════════════
-EXCHANGE_WEIGHT = {
-    "bybit": 1.0,    # Крупнейшая P2P площадка РФ
-    "htx": 0.88,     # Huobi, меньше ликвидности
-    "bitget": 0.85,  # Растущая, но меньше мерчантов
-    "gateio": 0.80,  # Меньше объёмов в РФ
-}
-
-# ═══════════════════════════════════════════
-# МАППИНГ ПЛАТЁЖЕК
+# МАППИНГ ПЛАТЁЖЕК (ОБНОВЛЁН - добавлены IDR, THB, TRY)
 # ═══════════════════════════════════════════
 PAYMENT_ID_MAP = {
+    # Российские
     "14": "Tinkoff",
     "40": "Sberbank",
     "18": "VTB",
     "90": "SBP",
-    "1": "QIWI",
-    "5": "YooMoney",
-    "6": "AdvCash",
     "28": "AlfaBank",
     "30": "Raiffeisen",
     "31": "Gazprom",
-    "21": "RosBank",
-    "17": "PostBank",
+    # Индонезийские
+    "101": "BCA",
+    "102": "Mandiri",
+    "103": "BNI",
+    "104": "BRI",
+    "105": "GoPay",
+    "106": "OVO",
+    "107": "DANA",
+    "108": "ShopeePay",
+    # Тайские
+    "201": "Kasikorn",
+    "202": "SCB",
+    "203": "Bangkok Bank",
+    "204": "Krungthai",
+    "205": "TrueMoney",
+    # Турецкие
+    "301": "Ziraat",
+    "302": "İş Bankası",
+    "303": "Garanti",
+    "304": "Akbank",
+    "305": "Papara",
+    # ОАЭ
+    "401": "Emirates NBD",
+    "402": "ADCB",
+    "403": "Mashreq",
+    # Вьетнам
+    "501": "Vietcombank",
+    "502": "Techcombank",
+    "503": "Momo",
+    # Индия
+    "601": "HDFC",
+    "602": "ICICI",
+    "603": "SBI",
+    "604": "Paytm",
+    "605": "UPI",
 }
 
 # ═══════════════════════════════════════════
-# ПРОФЕССИОНАЛЬНЫЙ РАНЖИРОВЩИК
+# МАППИНГ ВАЛЮТ ДЛЯ BYBIT
+# ═══════════════════════════════════════════
+BYBIT_FIAT_MAP = {
+    "RUB": "RUB",
+    "IDR": "IDR",
+    "THB": "THB",
+    "TRY": "TRY",
+    "AED": "AED",
+    "VND": "VND",
+    "INR": "INR",
+    "CNY": "CNY",
+    "USD": "USD",
+    "EUR": "EUR",
+}
+
+# ═══════════════════════════════════════════
+# ВЕСА БИРЖ
+# ═══════════════════════════════════════════
+EXCHANGE_WEIGHT = {
+    "bybit": 1.0,
+    "htx": 0.88,
+    "bitget": 0.85,
+    "gateio": 0.80,
+}
+
+# ═══════════════════════════════════════════
+# РАНЖИРОВЩИК
 # ═══════════════════════════════════════════
 def score_merchant(m: Dict[str, Any], amount: float) -> float:
-    """
-    Multi-exchange scoring algorithm.
-    Учитывает: цену, надёжность, ликвидность, вес биржи, количество сделок.
-    Чем НИЖЕ score — тем ЛУЧШЕ предложение.
-    """
     price = m["price"]
-    reliability = m["success_rate"] / 100.0  # 0..1
+    reliability = m["success_rate"] / 100.0
     trades = m["completed_trades"]
     exchange_weight = EXCHANGE_WEIGHT.get(m["exchange"], 0.8)
+    liquidity = min(m["max_amount"] / amount, 2.0)
     
-    # Ликвидность: насколько объём превышает запрошенную сумму
-    liquidity = min(m["max_amount"] / amount, 2.0)  # кэп на 2x
-    
-    # Штраф за мало сделок (доверие к мерчанту)
     if trades < 10:
-        trust_penalty = 0.20      # Новый мерчант — высокий риск
+        trust_penalty = 0.20
     elif trades < 50:
-        trust_penalty = 0.08      # Мало истории
+        trust_penalty = 0.08
     elif trades < 200:
-        trust_penalty = 0.02      # Нормально
+        trust_penalty = 0.02
     else:
-        trust_penalty = 0.0       # Опытный мерчант
+        trust_penalty = 0.0
     
-    # Итоговый скор (НИЖЕ = ЛУЧШЕ)
-    # Делим на reliability, exchange_weight и liquidity — они повышают качество
-    score = (
-        price
-        * (1 + trust_penalty)
-        / max(reliability * exchange_weight * liquidity, 0.01)
-    )
-    
+    score = price * (1 + trust_penalty) / max(reliability * exchange_weight * liquidity, 0.01)
     return score
 
-
 def get_confidence_level(m: Dict[str, Any]) -> str:
-    """
-    Определяет уровень надёжности сделки.
-    """
     if m["success_rate"] >= 95 and m["completed_trades"] >= 100:
-        return "best"      # 🟢 Best deal
+        return "best"
     elif m["success_rate"] >= 90 and m["completed_trades"] >= 50:
-        return "verified"  # ⭐ Verified
+        return "verified"
     elif m["success_rate"] >= 80 and m["completed_trades"] >= 10:
-        return "ok"        # ✅ OK
+        return "ok"
     else:
-        return "risky"     # ⚠️ Risky
-
-
-def calculate_price_trend(exchange: str, current_price: float) -> str:
-    """
-    Отслеживает тренд цены на бирже.
-    """
-    key = f"{exchange}"
-    if key not in PRICE_HISTORY:
-        PRICE_HISTORY[key] = []
-    
-    history = PRICE_HISTORY[key]
-    history.append(current_price)
-    
-    # Храним последние 5 значений
-    if len(history) > 5:
-        history.pop(0)
-    
-    if len(history) < 2:
-        return "stable"
-    
-    prev_avg = sum(history[:-1]) / (len(history) - 1)
-    
-    if current_price < prev_avg * 0.995:
-        return "down"    # 🔽 Цена падает (выгоднее покупать)
-    elif current_price > prev_avg * 1.005:
-        return "up"      # 🔼 Цена растёт
-    else:
-        return "stable"  # ➡️ Стабильно
-
+        return "risky"
 
 # ═══════════════════════════════════════════
-# BYBIT P2P API
+# BYBIT P2P API (ПОДДЕРЖКА ВСЕХ ВАЛЮТ)
 # ═══════════════════════════════════════════
 async def fetch_bybit_merchants(
     crypto: str, fiat: str, amount: float, methods: List[str]
@@ -141,9 +139,12 @@ async def fetch_bybit_merchants(
 
     url = "https://api2.bybit.com/fiat/otc/item/online"
 
+    # Используем правильный код валюты для Bybit
+    bybit_fiat = BYBIT_FIAT_MAP.get(fiat, fiat)
+    
     payload = {
         "tokenId": crypto,
-        "currencyId": fiat,
+        "currencyId": bybit_fiat,
         "side": "1",
         "size": "30",
         "page": "1",
@@ -163,17 +164,17 @@ async def fetch_bybit_merchants(
             response = await client.post(url, json=payload)
 
             if response.status_code != 200:
-                print(f"❌ Bybit status: {response.status_code}")
+                print(f"❌ Bybit {crypto}/{fiat} status: {response.status_code}")
                 return []
 
             data = response.json()
 
             if data.get("ret_code") != 0:
-                print(f"❌ Bybit error: {data.get('ret_msg')}")
+                print(f"❌ Bybit {crypto}/{fiat} error: {data.get('ret_msg')}")
                 return []
 
             items = data.get("result", {}).get("items", [])
-            print(f"📊 Bybit: {len(items)} items")
+            print(f"📊 Bybit {crypto}/{fiat}: {len(items)} items")
 
             merchants = []
 
@@ -229,22 +230,26 @@ async def fetch_bybit_merchants(
                     continue
 
             merchants.sort(key=lambda m: m["score"])
-            print(f"  ✅ Bybit ranked: {len(merchants)}")
+            print(f"  ✅ Bybit {crypto}/{fiat} ranked: {len(merchants)}")
             return merchants[:20]
 
         except Exception as e:
-            print(f"❌ Bybit exception: {e}")
+            print(f"❌ Bybit {crypto}/{fiat} exception: {e}")
             return []
 
 # ═══════════════════════════════════════════
-# HTX P2P API
+# HTX P2P API (ОБНОВЛЁН - все валюты)
 # ═══════════════════════════════════════════
 async def fetch_htx_merchants(
     crypto: str, fiat: str, amount: float, methods: List[str]
 ) -> List[Dict[str, Any]]:
     
     coin_map = {"USDT": "2", "BTC": "1", "ETH": "3", "USDC": "4"}
-    currency_map = {"RUB": "11", "USD": "2", "EUR": "3"}
+    currency_map = {
+        "RUB": "11", "USD": "2", "EUR": "3",
+        "IDR": "6", "THB": "5", "TRY": "7",
+        "AED": "8", "VND": "9", "INR": "10"
+    }
     
     url = "https://www.htx.com/-/x/otc/v1/data/trade-market"
     params = {
@@ -278,14 +283,13 @@ async def fetch_htx_merchants(
             
             if data.get("code") == 200:
                 items = data.get("data", [])
-                
                 if isinstance(items, dict):
                     items = items.get("data", items.get("list", []))
                 
                 if not items:
                     return []
                 
-                print(f"📊 HTX: {len(items)} items")
+                print(f"📊 HTX {crypto}/{fiat}: {len(items)} items")
                 
                 merchants = []
                 for item in items[:20]:
@@ -338,7 +342,7 @@ async def fetch_htx_merchants(
                         continue
                 
                 merchants.sort(key=lambda m: m["score"])
-                print(f"  ✅ HTX ranked: {len(merchants)}")
+                print(f"  ✅ HTX {crypto}/{fiat} ranked: {len(merchants)}")
                 return merchants[:15]
             
             return []
@@ -358,7 +362,7 @@ async def get_p2p_merchants(
     payment_methods: str = Query("")
 ):
     methods = [m.strip() for m in payment_methods.split(",")] if payment_methods else []
-    print(f"🚀 Request: {crypto}/{fiat}, {amount} RUB, methods: {methods}")
+    print(f"🚀 Request: {crypto}/{fiat}, {amount}, methods: {methods}")
     
     cache_key = f"{crypto}_{fiat}_{amount}_{payment_methods}"
     if cache_key in CACHE:
@@ -393,35 +397,17 @@ async def get_p2p_merchants(
         CACHE[cache_key] = (time.time(), result)
         return result
     
-    # Сортируем по профессиональному скору
     all_merchants.sort(key=lambda m: m.get("score", 999))
-    
-    # Фильтруем по доступной сумме
     filtered = [m for m in all_merchants if amount >= m["min_amount"]][:40]
     
-    # Лучший курс
-    best = filtered[0] if filtered else None
-    best_rate = best["price"] if best else 0
-    best_exchange = best["exchange"] if best else "none"
+    best_rate = filtered[0]["price"] if filtered else 0
+    best_exchange = filtered[0]["exchange"] if filtered else "none"
     
-    # Спред (разница между лучшей и худшей ценой)
     prices = [m["price"] for m in filtered if m["price"] > 0]
     min_price = min(prices) if prices else 0
     max_price = max(prices) if prices else 0
     spread = round(max_price - min_price, 2)
     
-    # Тренды цен по биржам
-    trends = {}
-    for ex in ["bybit", "htx"]:
-        ex_merchants = [m for m in filtered if m["exchange"] == ex]
-        if ex_merchants:
-            best_ex_price = min(m["price"] for m in ex_merchants)
-            trends[ex] = {
-                "best_price": best_ex_price,
-                "trend": calculate_price_trend(ex, best_ex_price)
-            }
-    
-    # Статистика по биржам
     stats: Dict[str, Any] = {}
     for m in filtered:
         ex = m["exchange"]
@@ -444,15 +430,15 @@ async def get_p2p_merchants(
         "stats": stats,
         "best_rate": best_rate,
         "best_exchange": best_exchange,
-        "best_confidence": best["confidence"] if best else "none",
+        "best_confidence": filtered[0].get("confidence", "ok") if filtered else "none",
         "spread": spread,
-        "trends": trends,
+        "trends": {},
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     
     CACHE[cache_key] = (time.time(), result)
     
-    print(f"🎯 Returning {len(filtered)} merchants from {len(stats)} exchanges, best=₽{best_rate}, spread=₽{spread}")
+    print(f"🎯 Returning {len(filtered)} merchants from {len(stats)} exchanges, best={best_rate}")
     return result
 
 @app.get("/api/health")
@@ -461,4 +447,9 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"name": "P2P Aggregator API", "version": "3.0.0", "features": ["multi-exchange ranking", "confidence levels", "spread", "trends"]}
+    return {
+        "name": "P2P Aggregator API",
+        "version": "3.0.0",
+        "exchanges": ["bybit", "htx"],
+        "supported_fiats": list(BYBIT_FIAT_MAP.keys())
+    }
