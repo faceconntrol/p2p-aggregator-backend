@@ -192,7 +192,7 @@ async def get_p2p_merchants(
     CACHE[cache_key] = (time.time(), result)
     return result
 
-# ═══════════════════════════ КУРСЫ БАНКОВ (АВТОМАТИЧЕСКИЙ СБОР) ═══════════════════════════
+# ═══════════════════════════ КУРСЫ БАНКОВ ═══════════════════════════
 
 async def fetch_tinkoff_rate():
     """Т-Банк через официальный API"""
@@ -205,11 +205,30 @@ async def fetch_tinkoff_rate():
             )
             if response.status_code == 200:
                 data = response.json()
-                rates = data.get("payload", {}).get("rates", [])
-                for rate in rates:
-                    if (rate.get("fromCurrency", {}).get("strCode") == "USD" and
-                        rate.get("toCurrency", {}).get("strCode") == "RUB"):
-                        return {"buy": rate.get("buy", 0), "sell": rate.get("sell", 0)}
+                if data.get("resultCode") == "OK":
+                    rates = data.get("payload", {}).get("rates", [])
+                    
+                    # DebitCardsTransfers — категория для переводов между счетами
+                    for rate in rates:
+                        if (rate.get("category") == "DebitCardsTransfers" and
+                            rate.get("fromCurrency", {}).get("strCode") == "840" and  # USD
+                            rate.get("toCurrency", {}).get("strCode") == "643"):      # RUB
+                            
+                            api_buy = rate.get("buy", 0)    # Банк покупает USD у вас
+                            api_sell = rate.get("sell", 0)  # Банк продаёт USD вам
+                            
+                            # Для нашего приложения: buy = банк продаёт вам USD
+                            print(f"✅ Tinkoff: buy={api_sell}, sell={api_buy}")
+                            return {"buy": api_sell, "sell": api_buy}
+                    
+                    # Fallback: любая категория USD→RUB
+                    for rate in rates:
+                        if (rate.get("fromCurrency", {}).get("strCode") == "840" and
+                            rate.get("toCurrency", {}).get("strCode") == "643"):
+                            api_buy = rate.get("buy", 0)
+                            api_sell = rate.get("sell", 0)
+                            print(f"⚠️ Tinkoff fallback: buy={api_sell}, sell={api_buy}")
+                            return {"buy": api_sell, "sell": api_buy}
     except Exception as e:
         print(f"❌ Tinkoff: {e}")
     return None
@@ -258,30 +277,33 @@ async def get_bank_rates():
     
     rates = {}
     
-    # Т-Банк
+    # Т-Банк — API
     t = await fetch_tinkoff_rate()
-    if t and t["buy"] > 0: rates["tinkoff"] = t
+    if t and t["buy"] > 0:
+        rates["tinkoff"] = t
+        print(f"✅ Tinkoff: buy={t['buy']}, sell={t['sell']}")
     
-    # Сбер
+    # Сбер — парсинг
     s = await fetch_sber_rate()
-    if s and s["buy"] > 0: rates["sber"] = s
+    if s and s["buy"] > 0:
+        rates["sber"] = s
     else:
         s = await fetch_banki_ru_rate("sberbank")
         if s: rates["sber"] = s
     
-    # Альфа
+    # Альфа — Banki.ru
     a = await fetch_banki_ru_rate("alfabank")
     if a: rates["alfa"] = a
     
-    # ВТБ
+    # ВТБ — Banki.ru
     v = await fetch_banki_ru_rate("vtb")
     if v: rates["vtb"] = v
     
     # Fallback
-    if "tinkoff" not in rates: rates["tinkoff"] = {"buy": 78.35, "sell": 72.30}
-    if "sber" not in rates: rates["sber"] = {"buy": 79.20, "sell": 71.70}
-    if "alfa" not in rates: rates["alfa"] = {"buy": 81.80, "sell": 73.00}
-    if "vtb" not in rates: rates["vtb"] = {"buy": 83.00, "sell": 71.50}
+    if "tinkoff" not in rates: rates["tinkoff"] = {"buy": 78.5, "sell": 74.4}
+    if "sber" not in rates: rates["sber"] = {"buy": 79.2, "sell": 71.7}
+    if "alfa" not in rates: rates["alfa"] = {"buy": 81.8, "sell": 73.0}
+    if "vtb" not in rates: rates["vtb"] = {"buy": 83.0, "sell": 71.5}
     
     result = {"rates": rates, "updated_at": datetime.now(timezone.utc).isoformat()}
     BANK_CACHE[cache_key] = (time.time(), result)
