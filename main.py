@@ -21,6 +21,8 @@ app.add_middleware(
 # ═══════════════════════════ КЭШ ═══════════════════════════
 CACHE: Dict[str, tuple] = {}
 CACHE_TTL = 10
+BANK_CACHE: Dict[str, tuple] = {}
+BANK_CACHE_TTL = 3600
 
 # ═══════════════════════════ МАППИНГ ПЛАТЁЖЕК ═══════════════════════════
 PAYMENT_ID_MAP = {
@@ -131,7 +133,7 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, methods: 
             print(f"❌ Bybit {crypto}/{fiat}: {e}")
             return []
 
-# ═══════════════════════════ API ENDPOINTS ═══════════════════════════
+# ═══════════════════════════ P2P ENDPOINT ═══════════════════════════
 @app.get("/api/p2p/merchants")
 async def get_p2p_merchants(
     crypto: str = Query("USDT"), fiat: str = Query("RUB"),
@@ -190,99 +192,100 @@ async def get_p2p_merchants(
     CACHE[cache_key] = (time.time(), result)
     return result
 
-# ═══════════════════════════ НОВЫЙ ЭНДПОИНТ: КУРСЫ БАНКОВ ═══════════════════════════
-@app.get("/api/bank/rates")
-async def get_bank_rates():
-    """Реальные курсы покупки наличного USD из банков РФ"""
-    rates = {}
-    
-    tinkoff = await fetch_tinkoff_rate()
-    if tinkoff: rates["tinkoff"] = tinkoff
-    
-    sber = await fetch_sber_rate()
-    if sber: rates["sber"] = sber
-    
-    alfa = await fetch_alfa_rate()
-    if alfa: rates["alfa"] = alfa
-    
-    vtb = await fetch_vtb_rate()
-    if vtb: rates["vtb"] = vtb
-    
-    if not rates:
-        rates = {
-            "tinkoff": {"buy": 80.4, "sell": 73.65},
-            "sber": {"buy": 79.2, "sell": 71.70},
-            "alfa": {"buy": 81.8, "sell": 73.0},
-            "vtb": {"buy": 83.0, "sell": 71.5}
-        }
-    
-    return {"rates": rates, "updated_at": datetime.now(timezone.utc).isoformat()}
+# ═══════════════════════════ КУРСЫ БАНКОВ (АВТОМАТИЧЕСКИЙ СБОР) ═══════════════════════════
 
 async def fetch_tinkoff_rate():
-    """Парсит tbank.ru/about/exchange/"""
+    """Т-Банк через официальный API"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("https://www.tbank.ru/about/exchange/", headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code != 200: return None
-            html = response.text
-            
-            # Ищем JSON в HTML: "currency":"USD","buy":78.35,"sell":72.30
-            match = re.search(r'"currency":"USD".*?"buy":(\d+\.?\d*).*?"sell":(\d+\.?\d*)', html)
-            if match:
-                return {"buy": float(match.group(1)), "sell": float(match.group(2))}
-            
-            # Альтернативный поиск
-            match = re.search(r'Доллар.*?(\d+\.?\d*).*?(\d+\.?\d*)', html, re.DOTALL)
-            if match:
-                return {"buy": float(match.group(2)), "sell": float(match.group(1))}
+            response = await client.post(
+                "https://api.tinkoff.ru/v1/currency_rates",
+                json={},
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            if response.status_code == 200:
+                data = response.json()
+                rates = data.get("payload", {}).get("rates", [])
+                for rate in rates:
+                    if (rate.get("fromCurrency", {}).get("strCode") == "USD" and
+                        rate.get("toCurrency", {}).get("strCode") == "RUB"):
+                        return {"buy": rate.get("buy", 0), "sell": rate.get("sell", 0)}
     except Exception as e:
         print(f"❌ Tinkoff: {e}")
     return None
 
 async def fetch_sber_rate():
-    """Парсит sberbank.ru"""
+    """Сбербанк через парсинг страницы"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("https://www.sberbank.ru/ru/quotes/currencies", headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code != 200: return None
-            html = response.text
-            
-            match = re.search(r'"isoCode":"USD".*?"buyPrice":(\d+\.?\d*).*?"sellPrice":(\d+\.?\d*)', html)
-            if match:
-                return {"buy": float(match.group(1)), "sell": float(match.group(2))}
+            response = await client.get(
+                "https://www.sberbank.ru/ru/quotes/currencies",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            if response.status_code == 200:
+                html = response.text
+                match = re.search(r'"isoCode":"USD".*?"buyPrice":(\d+\.?\d*).*?"sellPrice":(\d+\.?\d*)', html)
+                if match:
+                    return {"buy": float(match.group(1)), "sell": float(match.group(2))}
     except Exception as e:
         print(f"❌ Sber: {e}")
     return None
 
-async def fetch_alfa_rate():
-    """Парсит alfabank.ru"""
+async def fetch_banki_ru_rate(bank_code: str):
+    """Banki.ru — агрегатор курсов"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("https://alfabank.ru/currency/", headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code != 200: return None
-            html = response.text
-            
-            match = re.search(r'USD.*?(\d+\.?\d*).*?(\d+\.?\d*)', html, re.DOTALL)
-            if match:
-                return {"buy": float(match.group(2)), "sell": float(match.group(1))}
+            response = await client.get(
+                f"https://www.banki.ru/products/currency/cash/{bank_code}/moskva/",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if response.status_code == 200:
+                html = response.text
+                match = re.search(r'USD.*?(\d+\.\d+).*?(\d+\.\d+)', html, re.DOTALL)
+                if match:
+                    return {"buy": float(match.group(2)), "sell": float(match.group(1))}
     except Exception as e:
-        print(f"❌ Alfa: {e}")
+        print(f"❌ Banki.ru {bank_code}: {e}")
     return None
 
-async def fetch_vtb_rate():
-    """Парсит vtb.ru"""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("https://www.vtb.ru/personal/platezhi-i-perevody/obmen-valjuty/", headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code != 200: return None
-            html = response.text
-            
-            match = re.search(r'USD.*?(\d+\.?\d*).*?(\d+\.?\d*)', html, re.DOTALL)
-            if match:
-                return {"buy": float(match.group(2)), "sell": float(match.group(1))}
-    except Exception as e:
-        print(f"❌ VTB: {e}")
-    return None
+@app.get("/api/bank/rates")
+async def get_bank_rates():
+    cache_key = "bank_rates"
+    if cache_key in BANK_CACHE:
+        ts, cached = BANK_CACHE[cache_key]
+        if time.time() - ts < BANK_CACHE_TTL:
+            return cached
+    
+    rates = {}
+    
+    # Т-Банк
+    t = await fetch_tinkoff_rate()
+    if t and t["buy"] > 0: rates["tinkoff"] = t
+    
+    # Сбер
+    s = await fetch_sber_rate()
+    if s and s["buy"] > 0: rates["sber"] = s
+    else:
+        s = await fetch_banki_ru_rate("sberbank")
+        if s: rates["sber"] = s
+    
+    # Альфа
+    a = await fetch_banki_ru_rate("alfabank")
+    if a: rates["alfa"] = a
+    
+    # ВТБ
+    v = await fetch_banki_ru_rate("vtb")
+    if v: rates["vtb"] = v
+    
+    # Fallback
+    if "tinkoff" not in rates: rates["tinkoff"] = {"buy": 78.35, "sell": 72.30}
+    if "sber" not in rates: rates["sber"] = {"buy": 79.20, "sell": 71.70}
+    if "alfa" not in rates: rates["alfa"] = {"buy": 81.80, "sell": 73.00}
+    if "vtb" not in rates: rates["vtb"] = {"buy": 83.00, "sell": 71.50}
+    
+    result = {"rates": rates, "updated_at": datetime.now(timezone.utc).isoformat()}
+    BANK_CACHE[cache_key] = (time.time(), result)
+    return result
 
 @app.get("/api/health")
 async def health():
