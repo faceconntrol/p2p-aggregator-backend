@@ -257,35 +257,87 @@ async def fetch_binance_merchants(crypto: str, fiat: str, amount: float, methods
             return merchants[:15]
         except: return []
 
-# ═══════════════════════════ MEXC P2P ═══════════════════════════
+# ═══════════════════════════ MEXC P2P (ИСПРАВЛЕННЫЙ) ═══════════════════════════
 async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
+    """
+    MEXC P2P API - требует имитации браузера.
+    """
+    
+    params = {
+        "coin": crypto, "currency": fiat, "side": "BUY",
+        "page": 1, "pageSize": 20, "amount": str(int(amount)),
+        "merchant": "", "online": "1",
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.mexc.com",
+        "Referer": "https://www.mexc.com/buy-crypto/p2p",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    
     urls = [
-        "https://api.mexc.com/api/v3/p2p/advertise/list",
+        "https://otc.mexc.com/api/v3/p2p/advertise/list",
         "https://otc.mexc.com/api/p2p/advertise/list",
+        "https://api.mexc.com/api/v3/p2p/advertise/list",
     ]
     
     for url in urls:
         try:
-            payload = {"coin": crypto, "currency": fiat, "side": "BUY", "page": 1, "pageSize": 20, "amount": str(int(amount))}
+            print(f"🔍 Trying MEXC: {url}")
             
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Origin": "https://www.mexc.com",
-                "Referer": "https://www.mexc.com/buy-crypto/p2p",
-            }
-            
-            async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-                response = await client.get(url, params=payload)
-                if response.status_code == 403:
+            async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+                # Сначала GET запрос для получения cookie
+                try:
+                    await client.get("https://www.mexc.com/buy-crypto/p2p", headers={"User-Agent": headers["User-Agent"]})
+                except:
+                    pass
+                
+                response = await client.get(url, params=params)
+                
+                if response.status_code != 200:
+                    payload = {"coin": crypto, "currency": fiat, "side": "BUY", "page": 1, "pageSize": 20, "amount": str(int(amount))}
                     response = await client.post(url, json=payload)
-                if response.status_code != 200: continue
+                
+                if response.status_code != 200:
+                    print(f"  ❌ MEXC {url}: status {response.status_code}")
+                    continue
                 
                 data = response.json()
-                items = data.get("data", data.get("result", {}).get("list", []))
-                if not items: items = data.get("list", [])
-                if not items: continue
+                print(f"  📦 MEXC keys: {data.keys() if isinstance(data, dict) else type(data)}")
+                
+                items = None
+                
+                if isinstance(data, dict):
+                    if data.get("code") == 200:
+                        items = data.get("data", [])
+                        if isinstance(items, dict):
+                            items = items.get("list", items.get("data", []))
+                    elif "data" in data:
+                        items = data["data"]
+                        if isinstance(items, dict):
+                            items = items.get("list", [])
+                    elif "result" in data:
+                        result = data["result"]
+                        if isinstance(result, dict):
+                            items = result.get("list", result.get("advertiseList", []))
+                
+                if not items:
+                    if isinstance(data, list): items = data
+                    elif isinstance(data.get("data"), list): items = data["data"]
+                
+                if not items:
+                    print(f"  ❌ MEXC: no items in response")
+                    continue
+                
+                print(f"  ✅ MEXC: {len(items)} items")
                 
                 merchants = []
                 for item in items[:20]:
@@ -294,10 +346,10 @@ async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: L
                         min_amount = float(item.get("minAmount", item.get("minTradeAmount", 0)))
                         max_amount = float(item.get("maxAmount", item.get("maxTradeAmount", 0)))
                         quantity = float(item.get("amount", item.get("surplusAmount", 0)))
-                        success_rate = float(str(item.get("completedRate", "95")).replace("%", ""))
-                        trades = int(item.get("orderCount", 0))
-                        nickname = item.get("nickname", item.get("nickName", "Unknown"))
-                        adv_no = str(item.get("advNo", item.get("advertisementId", "")))
+                        success_rate = float(str(item.get("completedRate", item.get("userRate", "95"))).replace("%", ""))
+                        trades = int(item.get("orderCount", item.get("completedCount", 0)))
+                        nickname = item.get("nickname", item.get("nickName", item.get("merchantName", "Unknown")))
+                        adv_no = str(item.get("advNo", item.get("advertisementId", item.get("id", ""))))
                         
                         if amount < min_amount or amount > max_amount: continue
                         if success_rate < 50: continue
@@ -309,17 +361,25 @@ async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: L
                             "success_rate": success_rate, "completed_trades": trades,
                             "payment_methods": [],
                             "is_verified": trades >= 10 and success_rate >= 85,
-                            "deep_link": f"https://www.mexc.com/p2p/detail?advNo={adv_no}" if adv_no else "https://www.mexc.com/buy-crypto/p2p",
+                            "deep_link": f"https://www.mexc.com/buy-crypto/p2p" if not adv_no else f"https://www.mexc.com/p2p/detail?advNo={adv_no}",
                             "web_link": "https://www.mexc.com/buy-crypto/p2p"
                         }
                         m["confidence"] = get_confidence_level(m)
                         m["score"] = round(score_merchant(m, amount), 2)
                         merchants.append(m)
-                    except: continue
+                    except Exception as e:
+                        print(f"  ⚠️ MEXC parse: {e}")
+                        continue
                 
-                merchants.sort(key=lambda m: m["score"])
-                return merchants[:15]
-        except: continue
+                if merchants:
+                    merchants.sort(key=lambda m: m["score"])
+                    print(f"  ✅ MEXC ranked: {len(merchants)}")
+                    return merchants[:15]
+                
+        except Exception as e:
+            print(f"  ❌ MEXC {url} exception: {e}")
+    
+    print(f"  ❌ MEXC: all URLs failed")
     return []
 
 # ═══════════════════════════ P2P ENDPOINT ═══════════════════════════
