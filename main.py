@@ -221,9 +221,10 @@ async def get_p2p_merchants(
         if time.time() - ts < CACHE_TTL: return cached_data
     
     tasks = [
-        fetch_bybit_merchants(crypto, fiat, amount, methods),
-        fetch_htx_merchants(crypto, fiat, amount, methods),
-    ]
+    fetch_bybit_merchants(crypto, fiat, amount, methods),
+    fetch_htx_merchants(crypto, fiat, amount, methods),
+    fetch_binance_merchants(crypto, fiat, amount, methods),
+]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     all_merchants = []
