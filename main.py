@@ -327,6 +327,77 @@ async def get_bank_rates():
     result = {"rates": rates, "updated_at": datetime.now(timezone.utc).isoformat()}
     BANK_CACHE[cache_key] = (time.time(), result)
     return result
+    
+    # ═══════════════════════════ BINANCE P2P (ПУБЛИЧНЫЙ API - РАБОТАЕТ!) ═══════════════════════════
+async def fetch_binance_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
+    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+    
+    payload = {
+        "asset": crypto,
+        "fiat": fiat,
+        "tradeType": "BUY",
+        "page": 1,
+        "rows": 20,
+        "transAmount": str(int(amount))
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://p2p.binance.com",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        try:
+            response = await client.post(url, json=payload)
+            if response.status_code != 200: return []
+            
+            data = response.json()
+            items = data.get("data", [])
+            print(f"📊 Binance {crypto}/{fiat}: {len(items)} items")
+            
+            merchants = []
+            for item in items:
+                try:
+                    adv = item.get("adv", {})
+                    advertiser = item.get("advertiser", {})
+                    
+                    price = float(adv.get("price", 0))
+                    min_amount = float(adv.get("minSingleTransAmount", 0))
+                    max_amount = float(adv.get("maxSingleTransAmount", 0))
+                    quantity = float(adv.get("surplusAmount", 0))
+                    
+                    success_rate = float(advertiser.get("monthFinishRate", 0.95)) * 100
+                    trades = int(advertiser.get("monthOrderCount", 0))
+                    nickname = advertiser.get("nickName", "Unknown")
+                    adv_no = adv.get("advNo", "")
+                    
+                    if amount < min_amount or amount > max_amount: continue
+                    if success_rate < 50: continue
+                    
+                    m = {
+                        "id": str(adv_no),
+                        "exchange": "binance", "merchant_name": nickname,
+                        "price": price, "available_amount": quantity,
+                        "min_amount": min_amount, "max_amount": max_amount,
+                        "success_rate": success_rate,
+                        "completed_trades": trades,
+                        "payment_methods": [],
+                        "is_verified": trades >= 10 and success_rate >= 85,
+                        "deep_link": f"https://p2p.binance.com/ru/trade/detail?advNo={adv_no}" if adv_no else "https://p2p.binance.com/ru",
+                        "web_link": "https://p2p.binance.com/ru"
+                    }
+                    m["confidence"] = get_confidence_level(m)
+                    m["score"] = round(score_merchant(m, amount), 2)
+                    merchants.append(m)
+                except: continue
+            
+            merchants.sort(key=lambda m: m["score"])
+            return merchants[:15]
+        except Exception as e:
+            print(f"❌ Binance {crypto}/{fiat}: {e}")
+            return []
 
 @app.get("/api/health")
 async def health():
