@@ -8,7 +8,7 @@ import json
 import time
 import re
 
-app = FastAPI(title="P2P Aggregator API", version="3.1.0")
+app = FastAPI(title="P2P Aggregator API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ BYBIT_FIAT_MAP = {
     "USD": "USD", "EUR": "EUR",
 }
 
-EXCHANGE_WEIGHT = {"bybit": 1.0, "htx": 0.88}
+EXCHANGE_WEIGHT = {"bybit": 1.0, "htx": 0.88, "bitget": 0.85}
 
 # ═══════════════════════════ РАНЖИРОВЩИК ═══════════════════════════
 def score_merchant(m: Dict[str, Any], amount: float) -> float:
@@ -133,6 +133,80 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, methods: 
             print(f"❌ Bybit {crypto}/{fiat}: {e}")
             return []
 
+# ═══════════════════════════ HTX P2P ═══════════════════════════
+async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
+    coin_map = {"USDT": "2", "BTC": "1", "ETH": "3", "USDC": "4"}
+    currency_map = {"RUB": "11", "USD": "2", "EUR": "3", "IDR": "6", "THB": "5", "TRY": "7"}
+    
+    url = "https://www.htx.com/-/x/otc/v1/data/trade-market"
+    params = {
+        "coinId": coin_map.get(crypto, "2"),
+        "currency": currency_map.get(fiat, "11"),
+        "tradeType": "buy", "currPage": "1", "payMethod": "0",
+        "online": "1", "amount": str(int(amount)), "blockType": "general",
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+        "Origin": "https://www.htx.com",
+        "Referer": "https://www.htx.com/ru-ru/fiat-crypto/trade",
+        "Connection": "keep-alive",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        try:
+            response = await client.get(url, params=params)
+            if response.status_code != 200: return []
+            data = response.json()
+            
+            if data.get("code") == 200:
+                items = data.get("data", [])
+                if isinstance(items, dict): items = items.get("data", items.get("list", []))
+                if not items: return []
+                
+                merchants = []
+                for item in items[:20]:
+                    try:
+                        price = float(item.get("price", 0))
+                        min_amount = float(item.get("minTradeLimit", item.get("minAmount", 0)))
+                        max_amount = float(item.get("maxTradeLimit", item.get("maxAmount", 0)))
+                        finish_rate = float(item.get("monthFinishRate", 0.95))
+                        order_count = int(item.get("monthOrderCount", 0))
+                        
+                        if finish_rate < 0.50 or max_amount < amount: continue
+                        if amount < min_amount or amount > max_amount: continue
+                        
+                        ad_id = str(item.get("adId", ""))
+                        pay_raw = item.get("payMethods", [])
+                        pay_methods = [p.get("name", "") if isinstance(p, dict) else str(p) for p in pay_raw]
+                        
+                        if methods:
+                            methods_lower = [m.lower() for m in methods]
+                            pay_lower = [p.lower() for p in pay_methods]
+                            if not any(m in pay_lower for m in methods_lower): continue
+                        
+                        m = {
+                            "id": ad_id if ad_id else str(abs(hash(item.get("userName", "") + str(price)))),
+                            "exchange": "htx", "merchant_name": item.get("userName", "Unknown"),
+                            "price": price, "available_amount": max_amount,
+                            "min_amount": min_amount, "max_amount": max_amount,
+                            "success_rate": round(finish_rate * 100 if finish_rate < 1 else finish_rate, 1),
+                            "completed_trades": order_count, "payment_methods": pay_methods,
+                            "is_verified": item.get("isOnline", False) and order_count >= 10,
+                            "deep_link": f"https://www.htx.com/ru-ru/fiat-crypto/trade/detail?adId={ad_id}" if ad_id else "https://www.htx.com/ru-ru/fiat-crypto/trade",
+                            "web_link": "https://www.htx.com/ru-ru/fiat-crypto/trade"
+                        }
+                        m["confidence"] = get_confidence_level(m)
+                        m["score"] = round(score_merchant(m, amount), 2)
+                        merchants.append(m)
+                    except: continue
+                
+                merchants.sort(key=lambda m: m["score"])
+                return merchants[:15]
+        except: pass
+    return []
+
 # ═══════════════════════════ P2P ENDPOINT ═══════════════════════════
 @app.get("/api/p2p/merchants")
 async def get_p2p_merchants(
@@ -146,7 +220,10 @@ async def get_p2p_merchants(
         ts, cached_data = CACHE[cache_key]
         if time.time() - ts < CACHE_TTL: return cached_data
     
-    tasks = [fetch_bybit_merchants(crypto, fiat, amount, methods)]
+    tasks = [
+        fetch_bybit_merchants(crypto, fiat, amount, methods),
+        fetch_htx_merchants(crypto, fiat, amount, methods),
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     all_merchants = []
@@ -193,78 +270,38 @@ async def get_p2p_merchants(
     return result
 
 # ═══════════════════════════ КУРСЫ БАНКОВ ═══════════════════════════
-
 async def fetch_tinkoff_rate():
-    """Т-Банк через официальный API"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
-                "https://api.tinkoff.ru/v1/currency_rates",
-                json={},
+                "https://api.tinkoff.ru/v1/currency_rates", json={},
                 headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
             )
             if response.status_code == 200:
                 data = response.json()
                 if data.get("resultCode") == "OK":
                     rates = data.get("payload", {}).get("rates", [])
-                    
-                    # DebitCardsTransfers — категория для переводов между счетами
                     for rate in rates:
                         if (rate.get("category") == "DebitCardsTransfers" and
-                            rate.get("fromCurrency", {}).get("strCode") == "840" and  # USD
-                            rate.get("toCurrency", {}).get("strCode") == "643"):      # RUB
-                            
-                            api_buy = rate.get("buy", 0)    # Банк покупает USD у вас
-                            api_sell = rate.get("sell", 0)  # Банк продаёт USD вам
-                            
-                            # Для нашего приложения: buy = банк продаёт вам USD
-                            print(f"✅ Tinkoff: buy={api_sell}, sell={api_buy}")
-                            return {"buy": api_sell, "sell": api_buy}
-                    
-                    # Fallback: любая категория USD→RUB
-                    for rate in rates:
-                        if (rate.get("fromCurrency", {}).get("strCode") == "840" and
+                            rate.get("fromCurrency", {}).get("strCode") == "840" and
                             rate.get("toCurrency", {}).get("strCode") == "643"):
                             api_buy = rate.get("buy", 0)
                             api_sell = rate.get("sell", 0)
-                            print(f"⚠️ Tinkoff fallback: buy={api_sell}, sell={api_buy}")
                             return {"buy": api_sell, "sell": api_buy}
-    except Exception as e:
-        print(f"❌ Tinkoff: {e}")
+    except: pass
     return None
 
 async def fetch_sber_rate():
-    """Сбербанк через парсинг страницы"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 "https://www.sberbank.ru/ru/quotes/currencies",
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            )
-            if response.status_code == 200:
-                html = response.text
-                match = re.search(r'"isoCode":"USD".*?"buyPrice":(\d+\.?\d*).*?"sellPrice":(\d+\.?\d*)', html)
-                if match:
-                    return {"buy": float(match.group(1)), "sell": float(match.group(2))}
-    except Exception as e:
-        print(f"❌ Sber: {e}")
-    return None
-
-async def fetch_banki_ru_rate(bank_code: str):
-    """Banki.ru — агрегатор курсов"""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"https://www.banki.ru/products/currency/cash/{bank_code}/moskva/",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
             if response.status_code == 200:
-                html = response.text
-                match = re.search(r'USD.*?(\d+\.\d+).*?(\d+\.\d+)', html, re.DOTALL)
-                if match:
-                    return {"buy": float(match.group(2)), "sell": float(match.group(1))}
-    except Exception as e:
-        print(f"❌ Banki.ru {bank_code}: {e}")
+                match = re.search(r'"isoCode":"USD".*?"buyPrice":(\d+\.?\d*).*?"sellPrice":(\d+\.?\d*)', response.text)
+                if match: return {"buy": float(match.group(1)), "sell": float(match.group(2))}
+    except: pass
     return None
 
 @app.get("/api/bank/rates")
@@ -272,34 +309,16 @@ async def get_bank_rates():
     cache_key = "bank_rates"
     if cache_key in BANK_CACHE:
         ts, cached = BANK_CACHE[cache_key]
-        if time.time() - ts < BANK_CACHE_TTL:
-            return cached
+        if time.time() - ts < BANK_CACHE_TTL: return cached
     
     rates = {}
     
-    # Т-Банк — API
     t = await fetch_tinkoff_rate()
-    if t and t["buy"] > 0:
-        rates["tinkoff"] = t
-        print(f"✅ Tinkoff: buy={t['buy']}, sell={t['sell']}")
+    if t and t["buy"] > 0: rates["tinkoff"] = t
     
-    # Сбер — парсинг
     s = await fetch_sber_rate()
-    if s and s["buy"] > 0:
-        rates["sber"] = s
-    else:
-        s = await fetch_banki_ru_rate("sberbank")
-        if s: rates["sber"] = s
+    if s and s["buy"] > 0: rates["sber"] = s
     
-    # Альфа — Banki.ru
-    a = await fetch_banki_ru_rate("alfabank")
-    if a: rates["alfa"] = a
-    
-    # ВТБ — Banki.ru
-    v = await fetch_banki_ru_rate("vtb")
-    if v: rates["vtb"] = v
-    
-    # Fallback
     if "tinkoff" not in rates: rates["tinkoff"] = {"buy": 78.5, "sell": 74.4}
     if "sber" not in rates: rates["sber"] = {"buy": 79.2, "sell": 71.7}
     if "alfa" not in rates: rates["alfa"] = {"buy": 81.8, "sell": 73.0}
@@ -315,4 +334,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"name": "P2P Aggregator API", "version": "3.1.0"}
+    return {"name": "P2P Aggregator API", "version": "3.2.0", "exchanges": ["bybit", "htx"]}
