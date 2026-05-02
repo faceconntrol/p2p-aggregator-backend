@@ -6,7 +6,6 @@ from typing import List, Dict, Any
 from datetime import datetime, timezone
 import json
 import time
-import re
 
 app = FastAPI(title="P2P Aggregator API", version="3.3.0")
 
@@ -36,7 +35,7 @@ BYBIT_FIAT_MAP = {
     "USD": "USD", "EUR": "EUR",
 }
 
-EXCHANGE_WEIGHT = {"bybit": 1.0, "htx": 0.88, "binance": 0.95, "mexc": 0.9}
+EXCHANGE_WEIGHT = {"bybit": 1.0, "binance": 0.95, "mexc": 0.9}
 
 # ═══════════════════════════ РАНЖИРОВЩИК ═══════════════════════════
 def score_merchant(m: Dict[str, Any], amount: float) -> float:
@@ -131,72 +130,6 @@ async def fetch_bybit_merchants(crypto: str, fiat: str, amount: float, methods: 
             return merchants[:20]
         except Exception: return []
 
-# ═══════════════════════════ HTX P2P ═══════════════════════════
-async def fetch_htx_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
-    coin_map = {"USDT": "2", "BTC": "1", "ETH": "3"}
-    currency_map = {"RUB": "11", "USD": "2", "EUR": "3", "IDR": "6", "THB": "5", "TRY": "7"}
-    
-    url = "https://www.htx.com/-/x/otc/v1/data/trade-market"
-    params = {
-        "coinId": coin_map.get(crypto, "2"),
-        "currency": currency_map.get(fiat, "11"),
-        "tradeType": "buy", "currPage": "1", "payMethod": "0",
-        "online": "1", "amount": str(int(amount)), "blockType": "general",
-    }
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Origin": "https://www.htx.com",
-        "Connection": "keep-alive",
-    }
-
-    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-        try:
-            response = await client.get(url, params=params)
-            if response.status_code != 200: return []
-            data = response.json()
-            if data.get("code") != 200: return []
-            
-            items = data.get("data", [])
-            if isinstance(items, dict): items = items.get("data", items.get("list", []))
-            if not items: return []
-            
-            merchants = []
-            for item in items[:20]:
-                try:
-                    price = float(item.get("price", 0))
-                    min_amount = float(item.get("minTradeLimit", item.get("minAmount", 0)))
-                    max_amount = float(item.get("maxTradeLimit", item.get("maxAmount", 0)))
-                    finish_rate = float(item.get("monthFinishRate", 0.95))
-                    order_count = int(item.get("monthOrderCount", 0))
-                    
-                    if finish_rate < 0.50 or max_amount < amount: continue
-                    if amount < min_amount or amount > max_amount: continue
-                    
-                    ad_id = str(item.get("adId", ""))
-                    pay_methods = [p.get("name", "") if isinstance(p, dict) else str(p) for p in item.get("payMethods", [])]
-                    
-                    m = {
-                        "id": ad_id if ad_id else str(abs(hash(item.get("userName", "") + str(price)))),
-                        "exchange": "htx", "merchant_name": item.get("userName", "Unknown"),
-                        "price": price, "available_amount": max_amount,
-                        "min_amount": min_amount, "max_amount": max_amount,
-                        "success_rate": round(finish_rate * 100 if finish_rate < 1 else finish_rate, 1),
-                        "completed_trades": order_count, "payment_methods": pay_methods,
-                        "is_verified": item.get("isOnline", False) and order_count >= 10,
-                        "deep_link": f"https://www.htx.com/ru-ru/fiat-crypto/trade/detail?adId={ad_id}" if ad_id else "https://www.htx.com/ru-ru/fiat-crypto/trade",
-                        "web_link": "https://www.htx.com/ru-ru/fiat-crypto/trade"
-                    }
-                    m["confidence"] = get_confidence_level(m)
-                    m["score"] = round(score_merchant(m, amount), 2)
-                    merchants.append(m)
-                except: continue
-            
-            merchants.sort(key=lambda m: m["score"])
-            return merchants[:15]
-        except: return []
-
 # ═══════════════════════════ BINANCE P2P ═══════════════════════════
 async def fetch_binance_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
@@ -257,38 +190,59 @@ async def fetch_binance_merchants(crypto: str, fiat: str, amount: float, methods
             return merchants[:15]
         except: return []
 
-# ═══════════════════════════ MEXC P2P (НОВЫЙ ENDPOINT) ═══════════════════════════
+# ═══════════════════════════ MEXC P2P (ПРАВИЛЬНЫЙ ENDPOINT) ═══════════════════════════
 async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: List[str]) -> List[Dict[str, Any]]:
-    url = "https://www.mexc.com/api/platform/spot/market-v2/web/merchant/list"
+    coin_ids = {"USDT": "128f589271cb4951b03e71e6323eb7be"}
+    
+    pay_method_map = {
+        "Tinkoff": "12", "Sberbank": "1", "SBP": "26",
+        "AlfaBank": "5", "VTB": "2"
+    }
+    
+    pay_method = ""
+    if methods:
+        pay_method = pay_method_map.get(methods[0], "")
 
-    payload = {
-        "tradeType": "BUY",
-        "coinName": crypto,
-        "fiatCurrency": fiat,
-        "page": 1,
-        "pageSize": 20
+    url = "https://www.mexc.com/api/platform/p2p/api/market"
+
+    params = {
+        "adsType": "1",
+        "allowTrade": "false",
+        "amount": "",
+        "blockTrade": "false",
+        "certifiedMerchant": "false",
+        "coinId": coin_ids.get(crypto, coin_ids["USDT"]),
+        "countryCode": "",
+        "currency": fiat,
+        "follow": "false",
+        "haveTrade": "false",
+        "page": "1",
+        "payMethod": pay_method,
+        "tradeType": "SELL",
     }
 
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "*/*",
+        "Referer": "https://www.mexc.com/buy-crypto/p2p",
         "Origin": "https://www.mexc.com",
-        "Referer": "https://www.mexc.com/fiat/p2p"
+        "language": "en-US",
+        "x-platform-type": "web",
+        "X-Device-Id": "unknowndeviceid",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(url, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            response = await client.get(url, params=params, headers=headers)
 
             print("MEXC STATUS:", response.status_code)
-            print(response.text[:500])
+            print(response.text[:1000])
 
             if response.status_code != 200:
                 return []
 
             data = response.json()
-            items = data.get("data", {}).get("list", [])
+            items = data.get("data", [])
 
             merchants = []
             for item in items:
@@ -308,12 +262,12 @@ async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: L
                         "available_amount": float(item.get("quantity", 0)),
                         "min_amount": min_amount,
                         "max_amount": max_amount,
-                        "success_rate": 95,
-                        "completed_trades": 50,
+                        "success_rate": float(item.get("completionRate", 95)),
+                        "completed_trades": int(item.get("orderCount", 50)),
                         "payment_methods": [],
                         "is_verified": True,
-                        "deep_link": "https://www.mexc.com/fiat/p2p",
-                        "web_link": "https://www.mexc.com/fiat/p2p"
+                        "deep_link": "https://www.mexc.com/buy-crypto/p2p",
+                        "web_link": "https://www.mexc.com/buy-crypto/p2p"
                     }
 
                     merchant["confidence"] = get_confidence_level(merchant)
@@ -321,7 +275,7 @@ async def fetch_mexc_merchants(crypto: str, fiat: str, amount: float, methods: L
                     merchants.append(merchant)
 
                 except Exception as e:
-                    print("MEXC parse:", e)
+                    print("MEXC parse error:", e)
 
             merchants.sort(key=lambda x: x["score"])
             return merchants[:15]
@@ -345,7 +299,6 @@ async def get_p2p_merchants(
     
     tasks = [
         fetch_bybit_merchants(crypto, fiat, amount, methods),
-        fetch_htx_merchants(crypto, fiat, amount, methods),
         fetch_binance_merchants(crypto, fiat, amount, methods),
         fetch_mexc_merchants(crypto, fiat, amount, methods),
     ]
@@ -434,4 +387,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"name": "P2P Aggregator", "version": "3.3.0", "exchanges": ["bybit", "htx", "binance", "mexc"]}
+    return {"name": "P2P Aggregator", "version": "3.3.0", "exchanges": ["bybit", "binance", "mexc"]}
